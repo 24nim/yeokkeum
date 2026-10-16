@@ -1,0 +1,32 @@
+<div class="app" id="app">
+  <aside class="side" id="side" aria-label="메뉴"></aside>
+  <div class="main">
+    <header class="top" id="top"></header>
+    <main class="view" id="view" tabindex="-1"></main>
+    <div class="composer" id="composer" hidden>
+      <div class="cmp-in gut">
+        <div class="cmp-meta" id="cmp-meta"></div>
+        <div class="pend" id="cmp-pend" hidden></div>
+        <div class="cmp-row">
+          <button class="ibtn" type="button" data-a="cmpAttach" id="cmp-attach" aria-label="사진·파일 첨부"></button>
+          <label class="sr" for="cmp">메모</label>
+          <textarea id="cmp" rows="1" placeholder="메모를 쓰면 책에 엮어 드려요" enterkeyhint="enter"></textarea>
+          <button class="send" type="button" data-a="cmpSend" id="cmp-send" aria-label="저장" disabled></button>
+        </div>
+      </div>
+    </div>
+    <nav class="tabs" id="tabs" aria-label="화면"></nav>
+  </div>
+</div>
+<input type="file" id="file-pick" multiple hidden accept="image/*,application/pdf,text/plain,text/csv,text/markdown,application/json,.txt,.csv,.md,.json,.pdf">
+<input type="file" id="json-pick" hidden accept="application/json,.json">
+<div id="layers"></div>
+<div id="pdf-stage" aria-hidden="true"></div>
+<div id="gate" class="gate" hidden>
+  <div class="gate-in">
+    <div class="gate-shelf" aria-hidden="true"><i style="--bc:#2B6A60;height:92px"></i><i style="--bc:#8C5E1E;height:74px"></i><i style="--bc:#2D4A7A;height:100px"></i><i style="--bc:#6E3F66;height:66px"></i></div>
+    <h1 class="gate-title">엮음</h1>
+    <p class="gate-sub">메모를 엮어 책으로</p>
+    <div id="gate-body" style="width:100%"></div>
+  </div>
+</div>

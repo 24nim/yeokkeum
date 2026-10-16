@@ -1,6 +1,6 @@
 // 엮음 — offline support. App files: network first (so updates arrive), cache when offline.
-const V = 'yk-app-8091cb67d9';
-const SHELL = ['./', './index.html', './app.js?v=8091cb67d9', './config.js', './manifest.webmanifest',
+const V = 'yk-app-d56fbebbb0';
+const SHELL = ['./', './index.html', './app.js?v=d56fbebbb0', './config.js', './manifest.webmanifest',
   './vendor/firebase-app-compat.js', './vendor/firebase-auth-compat.js', './vendor/firebase-firestore-compat.js',
   './icons/icon-192.png', './icons/favicon-32.png'];
 self.addEventListener('install', (e) => {
