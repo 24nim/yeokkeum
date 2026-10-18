@@ -1,6 +1,6 @@
 // 엮음 — the app opens straight from this device (no waiting on a weak signal); new versions arrive in the background.
-const V = 'yk-app-2bd026b938';
-const SHELL = ['./', './index.html', './app.js?v=2bd026b938', './config.js', './manifest.webmanifest',
+const V = 'yk-app-277d7be96f';
+const SHELL = ['./', './index.html', './app.js?v=277d7be96f', './config.js', './manifest.webmanifest',
   './vendor/firebase-app-compat.js', './vendor/firebase-auth-compat.js', './vendor/firebase-firestore-compat.js',
   './icons/icon-192.png', './icons/favicon-32.png'];
 

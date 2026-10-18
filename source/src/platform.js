@@ -100,7 +100,7 @@ async function initCloud() {
       await loadScript('vendor/firebase-auth-compat.js');
       await loadScript('vendor/firebase-firestore-compat.js');
     }
-    firebase.initializeApp(CFG);
+    if (!firebase.apps || !firebase.apps.length) firebase.initializeApp(CFG);
     // version 2 kept unsent changes in Firestore's own offline store: open it once more so they go out
     const v2done = D.mode === 'device' ? await anyV2Done() : true;
     const flush = !v2done && await oldCacheExists();

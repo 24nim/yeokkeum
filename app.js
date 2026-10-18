@@ -1973,9 +1973,9 @@ const SYNC = (() => {
   async function upload(f) {
     const u8 = new Uint8Array(await f.blob.arrayBuffer());
     const n = Math.max(1, Math.ceil(u8.length / CHUNK));
-    for (let i = 0; i < n; i += 8) {
+    for (let i = 0; i < n; i += 4) {
       const b = fs.batch();
-      for (let j = i; j < Math.min(n, i + 8); j++) b.set(fs.doc(chunkPath(f.id, j)), { b: firebase.firestore.Blob.fromUint8Array(u8.slice(j * CHUNK, (j + 1) * CHUNK)) });
+      for (let j = i; j < Math.min(n, i + 4); j++) b.set(fs.doc(chunkPath(f.id, j)), { b: firebase.firestore.Blob.fromUint8Array(u8.slice(j * CHUNK, (j + 1) * CHUNK)) });
       await b.commit();
     }
     await fs.doc(metaPath(f.id)).set({ name: f.name || '파일', type: f.type || '', size: u8.length, n, created: f.created || Date.now(), have: FV().arrayUnion(DEV.id), want: [], ev: false, del: false, s: FV().serverTimestamp() }, { merge: true });
@@ -4469,7 +4469,7 @@ async function initCloud() {
       await loadScript('vendor/firebase-auth-compat.js');
       await loadScript('vendor/firebase-firestore-compat.js');
     }
-    firebase.initializeApp(CFG);
+    if (!firebase.apps || !firebase.apps.length) firebase.initializeApp(CFG);
     // version 2 kept unsent changes in Firestore's own offline store: open it once more so they go out
     const v2done = D.mode === 'device' ? await anyV2Done() : true;
     const flush = !v2done && await oldCacheExists();

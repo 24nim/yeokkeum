@@ -175,5 +175,6 @@
   Object.assign(firestore, { FieldValue, Timestamp, Blob: FBlob });
   const authFn = () => auth;
   authFn.GoogleAuthProvider = function () { this.setCustomParameters = () => {}; };
-  window.firebase = { initializeApp() { return {}; }, firestore, auth: authFn };
+  const apps = [];
+  window.firebase = { apps, initializeApp() { apps.push({}); return apps[0]; }, firestore, auth: authFn };
 })();
