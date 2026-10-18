@@ -288,6 +288,8 @@ const YK = (function () {
       fileLabels: arr(s.fileLabels).length ? uniq(arr(s.fileLabels).map(str).filter(Boolean)).slice(0, 20) : d.fileLabels,
       learn: normLearn(s.learn),
       inApp: s.inApp === undefined ? true : !!s.inApp,
+      bk: s.bk && num(s.bk.at) > 0 ? { at: num(s.bk.at), dev: str(s.bk.dev).slice(0, 40) } : null,
+      bkAny: num(s.bkAny) || 0,
       created: num(s.created) || d.created,
     };
   }
@@ -971,11 +973,122 @@ const YK = (function () {
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = YK;
 
+/* 엮음 — minimal ZIP writer/reader (stored entries, UTF-8 names) for backups. No compression: photos are
+   already compressed, and storing keeps memory low because file contents are passed through as Blobs. */
+const ZIP = (function () {
+  'use strict';
+  const enc = new TextEncoder();
+  let TABLE = null;
+  function table() {
+    if (TABLE) return TABLE;
+    TABLE = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; TABLE[n] = c >>> 0; }
+    return TABLE;
+  }
+  function crc32(u8, prev) {
+    const T = table();
+    let c = ((prev || 0) ^ 0xFFFFFFFF) >>> 0;
+    for (let i = 0; i < u8.length; i++) c = T[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  const dosTime = (d) => ((d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2)) & 0xFFFF;
+  const dosDate = (d) => (((Math.max(1980, d.getFullYear()) - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF;
+  const SLICE = 8 * 1048576;
+
+  function writer() {
+    const parts = [];
+    const cd = [];
+    let offset = 0;
+    async function add(name, data, date) {
+      const nameU8 = enc.encode(name);
+      const blob = data instanceof Blob ? data : new Blob([typeof data === 'string' ? enc.encode(data) : data]);
+      const size = blob.size;
+      let crc = 0;
+      for (let i = 0; i < size; i += SLICE) crc = crc32(new Uint8Array(await blob.slice(i, Math.min(size, i + SLICE)).arrayBuffer()), crc);
+      if (offset + 30 + nameU8.length + size > 0xFFFFFFF0 || cd.length >= 65000) throw Object.assign(new Error('zip-too-big'), { code: 'zip-too-big' });
+      const d = date instanceof Date && !isNaN(date) ? date : new Date();
+      const h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+      h.setUint16(10, dosTime(d), true); h.setUint16(12, dosDate(d), true);
+      h.setUint32(14, crc, true); h.setUint32(18, size, true); h.setUint32(22, size, true);
+      h.setUint16(26, nameU8.length, true); h.setUint16(28, 0, true);
+      parts.push(new Uint8Array(h.buffer), nameU8, blob);
+      cd.push({ nameU8, crc, size, offset, t: dosTime(d), d: dosDate(d) });
+      offset += 30 + nameU8.length + size;
+    }
+    function finish() {
+      const start = offset;
+      let cdSize = 0;
+      for (const e of cd) {
+        const h = new DataView(new ArrayBuffer(46));
+        h.setUint32(0, 0x02014b50, true); h.setUint16(4, 20, true); h.setUint16(6, 20, true); h.setUint16(8, 0x0800, true); h.setUint16(10, 0, true);
+        h.setUint16(12, e.t, true); h.setUint16(14, e.d, true);
+        h.setUint32(16, e.crc, true); h.setUint32(20, e.size, true); h.setUint32(24, e.size, true);
+        h.setUint16(28, e.nameU8.length, true); h.setUint16(30, 0, true); h.setUint16(32, 0, true); h.setUint16(34, 0, true); h.setUint16(36, 0, true);
+        h.setUint32(38, 0, true); h.setUint32(42, e.offset, true);
+        parts.push(new Uint8Array(h.buffer), e.nameU8);
+        cdSize += 46 + e.nameU8.length;
+      }
+      const z = new DataView(new ArrayBuffer(22));
+      z.setUint32(0, 0x06054b50, true); z.setUint16(4, 0, true); z.setUint16(6, 0, true);
+      z.setUint16(8, cd.length, true); z.setUint16(10, cd.length, true);
+      z.setUint32(12, cdSize, true); z.setUint32(16, start, true); z.setUint16(20, 0, true);
+      parts.push(new Uint8Array(z.buffer));
+      return new Blob(parts, { type: 'application/zip' });
+    }
+    return { add, finish, get size() { return offset; }, get count() { return cd.length; } };
+  }
+
+  /** Reads entries straight from the file, one at a time (the whole archive is never loaded). */
+  async function reader(file) {
+    const size = file.size;
+    const tailLen = Math.min(size, 65557);
+    const tail = new Uint8Array(await file.slice(size - tailLen).arrayBuffer());
+    let eocd = -1;
+    for (let i = tail.length - 22; i >= 0; i--) if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) { eocd = i; break; }
+    if (eocd < 0) throw Object.assign(new Error('not-zip'), { code: 'not-zip' });
+    const dv = new DataView(tail.buffer, tail.byteOffset + eocd, 22);
+    const n = dv.getUint16(10, true), cdSize = dv.getUint32(12, true), cdOff = dv.getUint32(16, true);
+    const cdU8 = new Uint8Array(await file.slice(cdOff, cdOff + cdSize).arrayBuffer());
+    const cv = new DataView(cdU8.buffer, cdU8.byteOffset, cdU8.byteLength);
+    const dec = new TextDecoder();
+    const entries = new Map();
+    let p = 0;
+    for (let i = 0; i < n && p + 46 <= cdU8.length; i++) {
+      if (cv.getUint32(p, true) !== 0x02014b50) break;
+      const method = cv.getUint16(p + 10, true), csize = cv.getUint32(p + 20, true), usize = cv.getUint32(p + 24, true);
+      const nl = cv.getUint16(p + 28, true), xl = cv.getUint16(p + 30, true), cl = cv.getUint16(p + 32, true), off = cv.getUint32(p + 42, true);
+      const name = dec.decode(cdU8.subarray(p + 46, p + 46 + nl));
+      entries.set(name, { name, method, csize, usize, off });
+      p += 46 + nl + xl + cl;
+    }
+    async function blob(name, type) {
+      const e = entries.get(name);
+      if (!e) return null;
+      const h = new DataView(await file.slice(e.off, e.off + 30).arrayBuffer());
+      if (h.getUint32(0, true) !== 0x04034b50) throw Object.assign(new Error('bad-zip'), { code: 'bad-zip' });
+      const start = e.off + 30 + h.getUint16(26, true) + h.getUint16(28, true);
+      const raw = file.slice(start, start + e.csize);
+      if (e.method === 0) return new Blob([raw], { type: type || '' });
+      if (e.method === 8 && typeof DecompressionStream !== 'undefined') {
+        const s = raw.stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        return new Blob([await new Response(s).arrayBuffer()], { type: type || '' });
+      }
+      throw Object.assign(new Error('zip-method'), { code: 'zip-method' });
+    }
+    async function text(name) { const b = await blob(name); return b ? b.text() : null; }
+    return { names: () => Array.from(entries.keys()), has: (x) => entries.has(x), blob, text };
+  }
+
+  return { writer, reader, crc32 };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = ZIP;
+
 (function () {
 'use strict';
 const Y = YK;
 const APP_URL = (location.origin + location.pathname).replace(/index\.html$/, '');
-const VERSION = '2.0';
+const VERSION = '3.0';
 const CFG = window.YK_FIREBASE || null;
 const OWNER = String(window.YK_OWNER || '').toLowerCase();
 const COLORS = ['#2B6A60', '#2D4A7A', '#55652A', '#8C5E1E', '#9C3F33', '#6E3F66', '#4A5157', '#6B4A35', '#3B6E8F', '#7A6A2E'];
@@ -988,12 +1101,22 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const coarse = () => { try { return matchMedia('(pointer: coarse)').matches; } catch (e) { return false; } };
 const parseAmount = (s) => { const n = Math.round(Number(String(s || '').replace(/[^\d.]/g, ''))); return Number.isFinite(n) ? n : 0; };
+const fmtBytes = (b) => { b = Number(b) || 0; if (b >= 1073741824) return (b / 1073741824).toFixed(1).replace(/\.0$/, '') + 'GB'; if (b >= 1048576) return (b / 1048576).toFixed(b >= 104857600 ? 0 : 1).replace(/\.0$/, '') + 'MB'; if (b >= 1024) return Math.round(b / 1024) + 'KB'; return b + 'B'; };
+const randHex = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n))).map((b) => b.toString(16).padStart(2, '0')).join('');
+function ago(ms) {
+  if (!ms) return '';
+  const s = (Date.now() - ms) / 1000;
+  if (s < 90) return '방금';
+  if (s < 3600) return `${Math.round(s / 60)}분 전`;
+  if (s < 86400) return `${Math.round(s / 3600)}시간 전`;
+  const d = Math.round(s / 86400);
+  return d === 1 ? '어제' : `${d}일 전`;
+}
 
 const LS = {
   get(k) { try { const v = localStorage.getItem(k); return v == null ? null : JSON.parse(v); } catch (e) { return null; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } },
-  ok() { try { localStorage.setItem('__yk', '1'); localStorage.removeItem('__yk'); return true; } catch (e) { return false; } },
 };
 
 const ICON = {
@@ -1027,6 +1150,9 @@ const ICON = {
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
   refresh: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4.2h-4.2"/>',
   arrows: '<path d="M8 7h11M15.5 3.5 19 7l-3.5 3.5M16 17H5M8.5 13.5 5 17l3.5 3.5"/>',
+  box: '<path d="M4 7.5 12 4l8 3.5v9L12 20l-8-3.5z"/><path d="M4 7.5 12 11l8-3.5M12 11v9"/>',
+  phone: '<rect x="7" y="3" width="10" height="18" rx="2"/><path d="M11 17.5h2"/>',
+  cloud: '<path d="M7.5 18.5h10a4 4 0 0 0 .6-8 6 6 0 0 0-11.6 1.6A3.3 3.3 0 0 0 7.5 18.5z"/>',
 };
 const ic = (n) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICON[n] || ''}</svg>`;
 
@@ -1035,15 +1161,21 @@ const S = {
   tab: 'log', mode: 'd', composeDate: Y.today(), curSec: null,
   book: null, bookView: {}, bookRange: {}, bookFrom: {}, bookTo: {}, bookPer: {}, bookSort: {}, groupBy: {},
   statsRange: 'month', statsFrom: '', statsTo: '',
-  orgRunning: new Set(), aiBlocked: '', freshIds: new Set(), pendFiles: [], uploading: 0,
-  remMsg: {}, usage: null, todayAtBoot: Y.today(), userEmail: '',
+  orgRunning: new Set(), freshIds: new Set(), pendFiles: [], uploading: 0,
+  remMsg: {}, todayAtBoot: Y.today(),
   stickBottom: true, scrollToEnd: true, renderDeferred: false, chartDir: 'out',
+  store: null, cloudInfo: null,
 };
 const D = {
-  mode: 'boot', uid: null, base: '', books: new Map(), settings: Y.defaultSettings(), index: { months: {} }, indexExists: false,
-  entries: new Map(), months: new Map(), pending: 0, failed: new Map(), ready: false, localReason: '', unsubMeta: null,
+  mode: 'boot',           // 'device': kept in this device's store · 'memory': nothing can be kept
+  books: new Map(), settings: Y.defaultSettings(), index: { months: {} },
+  entries: new Map(), months: new Map(), ready: false,
+  user: null,             // signed-in owner {uid, email}
+  cloud: 'loading',       // 'loading' | 'none' (no relay configured) | 'ready'
+  pendingLocal: 0, saveErr: '', persisted: null,
 };
-const CAP = { db: null, auth: null, user: null, assets: null, sample: null, downloads: null, mcp: null, perms: null };
+const DEV = { id: '', name: '', first: 0 };
+const CAP = { db: null, auth: null };
 
 const booksArr = () => Array.from(D.books.values()).sort((a, b) => (a.order - b.order) || (a.created - b.created) || a.name.localeCompare(b.name));
 const notebooks = () => booksArr().filter((b) => b.kind === 'note');
@@ -1056,206 +1188,83 @@ const saveUi = () => LS.set('yk:ui', { mode: S.mode, bookView: S.bookView, bookR
 let rq = 0;
 function scheduleRender() { if (rq) return; rq = requestAnimationFrame(() => { rq = 0; render(); }); }
 
-// ---------- writes ----------
-// Firebase keeps its own durable offline queue, so every change is handed over at once
-// (nothing waits in memory, nothing is lost if the app closes while offline).
-const Q = new Map(); // path -> writes not yet confirmed by the server
-const docPath = (rel) => `${D.base}/${rel}`;
-const entryRel = (id, m) => `m${m}/e/${id}`;
-const hasQueued = (rel) => Q.has(docPath(rel));
+// ---------- versions: a clock that never runs backwards on this device ----------
+let lastV = 0;
+let hlcTimer = 0;
+function nextV() {
+  const n = Date.now();
+  lastV = n > lastV ? n : lastV + 1;
+  clearTimeout(hlcTimer); hlcTimer = setTimeout(() => { if (D.mode === 'device') STORE.setMeta('hlc', lastV).catch(() => {}); }, 400);
+  return lastV;
+}
+function seenV(v) { if (v > lastV) lastV = v; }
 
-function trackWrite(path, p, onFail) {
-  Q.set(path, (Q.get(path) || 0) + 1);
-  D.pending++;
+const recKey = (k, id) => `${k}-${id}`;
+function makeRec(k, id, data) {
+  const r = { key: recKey(k, id), k, id, v: nextV(), dv: DEV.id, del: 0, d: data, dirty: 1 };
+  if (k === 'e') r.m = Y.monthOf(data.date);
+  return r;
+}
+function tombstone(k, id) { return { key: recKey(k, id), k, id, v: nextV(), dv: DEV.id, del: 1, d: null, dirty: 1 }; }
+
+// ---------- saving on this device ----------
+let chain = Promise.resolve();
+const memRecs = new Map(); // memory mode only
+function persist(rec, after) {
+  if (D.mode !== 'device') { memRecs.set(rec.key, rec); if (after) after(); return Promise.resolve(); }
+  D.pendingLocal++;
   updateSync();
-  p.catch(onFail).finally(() => {
-    const n = (Q.get(path) || 1) - 1;
-    if (n > 0) Q.set(path, n); else Q.delete(path);
-    D.pending--;
-    updateSync();
-  });
+  const p = chain = chain.then(() => STORE.put(rec)).then(() => {
+    if (D.saveErr) { D.saveErr = ''; scheduleRender(); }
+    if (after) after();
+    SYNC.kick();
+    BUS.post({ t: 'rec', key: rec.key });
+  }).catch((e) => {
+    console.warn('[엮음] save failed', e);
+    D.saveErr = (e && e.name) || 'error';
+    toast(e && e.name === 'QuotaExceededError' ? '이 기기 저장 공간이 가득 차서 저장하지 못했어요. 휴대폰 저장 공간을 비워 주세요.' : '이 기기에 저장하지 못했어요. 앱을 다시 열어 주세요.', { long: true });
+    scheduleRender();
+  }).finally(() => { D.pendingLocal--; updateSync(); });
+  return p;
 }
 
-function enqueue(rel, op, data) {
-  if (D.mode !== 'cloud') { persistLocalSoon(); return; }
-  const path = docPath(rel);
-  const job = { op, data };
-  let p;
-  try {
-    const ref = CAP.db.doc(path);
-    p = op === 'set' ? ref.set(data) : op === 'update' ? ref.set(data, { merge: true }) : ref.delete();
-  } catch (e) { onWriteError(e, path, job, rel); return; }
-  D.failed.delete(path);
-  trackWrite(path, p, (e) => onWriteError(e, path, job, rel));
-}
-
-function onWriteError(e, path, job, rel) {
-  const c = (e && e.code) || 'error';
-  console.warn('[엮음] write failed', c, path, e);
-  if (rel) D.failed.set(path, { rel, job });
-  if (c === 'permission-denied' || c === 'unauthenticated') toast('이 계정으로는 저장할 수 없어요. 설정에서 로그인한 계정을 확인해 주세요.', { long: true });
-  else if (c === 'resource-exhausted') toast('오늘 무료 저장 한도를 넘었어요. 한국 시간 오후 4~5시쯤 한도가 다시 채워지면 ‘저장 실패’를 눌러 다시 저장하세요.', { long: true });
-  else if (c === 'invalid-argument') toast('저장할 수 없는 내용이 있어요. 글이나 첨부가 너무 크지 않은지 확인해 주세요.', { long: true });
-  else toast('저장하지 못한 내용이 있어요. 상단의 ‘저장 실패’를 눌러 다시 시도하세요.', { long: true });
-  updateSync();
-}
-
-function retryFailed() {
-  const jobs = Array.from(D.failed.values());
-  D.failed.clear();
-  for (const { rel, job } of jobs) enqueue(rel, job.op, job.data);
-  updateSync();
-}
-
-// ---------- local fallback ----------
-let lsTimer = 0;
-function persistLocalSoon() {
-  if (D.mode !== 'local') return;
-  clearTimeout(lsTimer);
-  lsTimer = setTimeout(() => {
-    const ok = LS.set('yk:data', {
-      v: 1,
-      books: booksArr().map((b) => Object.assign({ id: b.id }, Y.bookDoc(b))),
-      settings: D.settings,
-      index: D.index,
-      entries: Array.from(D.entries.values()).map((e) => Object.assign({ id: e.id }, Y.entryDoc(e))),
-    });
-    if (!ok) toast('이 기기 저장 공간이 부족해 저장하지 못했어요.');
-  }, 300);
-}
-
-function initLocal(reason) {
-  D.mode = LS.ok() ? 'local' : 'memory';
-  D.localReason = reason || '';
-  const saved = D.mode === 'local' ? LS.get('yk:data') : null;
-  if (saved && Array.isArray(saved.books) && saved.books.length) {
-    for (const b of saved.books) D.books.set(b.id, Y.normBook(b.id, b));
-    D.settings = Y.normSettings(saved.settings);
-    D.index = { months: Object.assign({}, (saved.index && saved.index.months) || {}) };
-    for (const e of saved.entries || []) { const x = Y.normEntry(e.id, e); x._m = Y.monthOf(x.date); D.entries.set(x.id, x); }
-  } else {
-    for (const b of Y.defaultBooks()) D.books.set(b.id, b);
-    D.settings = Y.defaultSettings();
-  }
-  D.indexExists = true;
-  D.ready = true;
-  render();
-  afterReady();
-}
-
-// ---------- cloud ----------
-async function initCloud(uid) {
-  D.mode = 'cloud'; D.uid = uid; D.base = `data/users/${uid}`;
-  const sref = CAP.db.doc(docPath('settings'));
-  let snap = null;
-  try {
-    snap = await sref.get();
-    // a missing document read from this device's cache may only mean "never synced here yet"
-    if (!snap.exists && snap.metadata && snap.metadata.fromCache) snap = await sref.get({ source: 'server' });
-  } catch (e) {
-    if (e && e.code === 'permission-denied') { showGate('denied'); return; }
-    console.warn('[엮음] settings read failed', e);
-    showGate('offline');
-    window.addEventListener('online', () => location.reload(), { once: true });
-    return;
-  }
-  await new Promise((resolve) => {
-    let done = false;
-    const finish = () => { if (!done) { done = true; resolve(); } };
-    setTimeout(finish, 6000);
-    D.unsubMeta = CAP.db.collection(D.base).onSnapshot((qs) => {
-      for (const ch of qs.docChanges()) {
-        const id = ch.doc.id;
-        if (ch.type === 'removed') { if (id.startsWith('b-')) D.books.delete(id.slice(2)); continue; }
-        const data = ch.doc.data() || {};
-        if (id === 'settings') { if (!hasQueued('settings')) D.settings = Y.normSettings(data); }
-        else if (id === 'index') { D.indexExists = true; if (!hasQueued('index')) D.index = { months: Object.assign({}, data.months || {}) }; }
-        else if (id.startsWith('b-')) { if (!hasQueued(id)) D.books.set(id.slice(2), Y.normBook(id.slice(2), data)); }
-      }
-      finish();
-      scheduleRender();
-    }, (err) => {
-      console.warn('[엮음] meta subscription ended', err);
-      if (err && err.code === 'permission-denied') showGate('denied');
-      finish();
-    });
-  });
-  if (!snap.exists) firstRun(); else D.settings = Y.normSettings(snap.data());
-  const m0 = Y.monthOf(Y.today());
-  await Promise.all([ensureMonth(m0, true), ensureMonth(Y.addMonths(m0, -1), true)]);
-  D.ready = true;
-  hideGate();
-  render();
-  afterReady();
-}
-
-function firstRun() {
-  const books = Y.defaultBooks();
-  for (const b of books) { if (!D.books.has(b.id)) { D.books.set(b.id, b); enqueue('b-' + b.id, 'set', Y.bookDoc(b)); } }
-  D.settings = Y.defaultSettings();
-  enqueue('settings', 'set', D.settings);
-}
-
-function putEntry(id, data, m) {
+// ---------- months: entries are read from this device month by month ----------
+function putEntryMem(id, data, v) {
   const e = Y.normEntry(id, data);
-  e._m = m;
+  e._m = Y.monthOf(e.date);
+  e._v = v || 0;
   D.entries.set(id, e);
   return e;
 }
 
-// month loading: live (current + previous month) or one-off reads, at most 3 reads at a time
-const loadWait = [];
-let loadActive = 0;
-function ensureMonth(m, live) {
+function ensureMonth(m) {
   const st = D.months.get(m);
   if (st) return st.promise;
   let resolve;
   const promise = new Promise((r) => { resolve = r; });
-  const rec = { state: 'loading', live: !!live, promise, unsub: null };
+  const rec = { state: 'loading', promise };
   D.months.set(m, rec);
-  if (D.mode !== 'cloud') { rec.state = 'ready'; resolve(); return promise; }
-  const coll = CAP.db.collection(`${D.base}/m${m}/e`).limit(1000);
-  const replaceMonth = (docs) => {
-    const ids = new Set(docs.map((d) => d.id));
-    for (const [id, e] of D.entries) if (e._m === m && !ids.has(id) && !hasQueued(entryRel(id, m))) D.entries.delete(id);
-    for (const d of docs) if (!hasQueued(entryRel(d.id, m))) putEntry(d.id, d.data(), m);
-  };
-  if (live) {
-    let first = true;
-    rec.unsub = coll.onSnapshot((qs) => {
-      if (first) { first = false; replaceMonth(qs.docs); rec.state = 'ready'; resolve(); }
-      else {
-        for (const ch of qs.docChanges()) {
-          const id = ch.doc.id;
-          if (hasQueued(entryRel(id, m))) continue;
-          if (ch.type === 'removed') { const cur = D.entries.get(id); if (cur && cur._m === m) D.entries.delete(id); }
-          else putEntry(id, ch.doc.data(), m);
-        }
-      }
-      scheduleRender();
-    }, (err) => {
-      console.warn('[엮음] month subscription ended', m, err);
-      if (rec.state !== 'ready') { rec.state = 'ready'; resolve(); }
-      rec.live = false;
-    });
-  } else {
-    const run = () => {
-      loadActive++;
-      coll.get().then((qs) => { replaceMonth(qs.docs); rec.state = 'ready'; })
-        .catch((err) => { console.warn('[엮음] month read failed', m, err); D.months.delete(m); toast(`${Y.fmtMonth(m)} 기록을 불러오지 못했어요.`); })
-        .finally(() => { loadActive--; resolve(); scheduleRender(); const nx = loadWait.shift(); if (nx) nx(); });
-    };
-    if (loadActive < 3) run(); else loadWait.push(run);
+  if (D.mode !== 'device') {
+    for (const r of memRecs.values()) if (r.k === 'e' && !r.del && r.m === m && !D.entries.has(r.id)) putEntryMem(r.id, r.d, r.v);
+    rec.state = 'ready'; resolve(); return promise;
   }
+  STORE.byMonth(m).then((list) => {
+    for (const r of list) {
+      if (r.k !== 'e' || r.del || !r.d) continue;
+      const cur = D.entries.get(r.id);
+      if (cur && (cur._v || 0) > r.v) continue; // a newer copy is already on screen
+      putEntryMem(r.id, r.d, r.v);
+    }
+    rec.state = 'ready';
+  }).catch((e) => { console.warn('[엮음] month read failed', m, e); D.months.delete(m); })
+    .finally(() => { resolve(); scheduleRender(); });
   return promise;
 }
 
 const monthReady = (m) => { const s = D.months.get(m); return !!(s && s.state === 'ready'); };
 function needMonths(ms) {
   const missing = ms.filter((m) => !monthReady(m));
-  if (!missing.length) return true;
-  if (D.mode === 'cloud') missing.forEach((m) => ensureMonth(m, false));
-  else missing.forEach((m) => ensureMonth(m, false));
+  missing.forEach((m) => ensureMonth(m));
   return missing.every((m) => monthReady(m));
 }
 function monthsForRange(from, to) {
@@ -1264,57 +1273,94 @@ function monthsForRange(from, to) {
   return all.filter((m) => known.has(m) || m === Y.monthOf(Y.today()) || m === Y.addMonths(Y.monthOf(Y.today()), -1));
 }
 function monthsWithBook(id) {
-  return Object.keys(D.index.months || {}).filter((m) => (parseB(D.index.months[m].b)[id] || 0) > 0).sort();
+  return Object.keys(D.index.months || {}).filter((m) => ((D.index.months[m].b || {})[id] || 0) > 0).sort();
 }
 async function loadMonthsWithProgress(ms, onProg) {
   let done = 0;
   const todo = ms.filter((m) => !monthReady(m));
-  if (!todo.length) { onProg && onProg(1, 1); return; }
-  await Promise.all(todo.map((m) => ensureMonth(m, false).then(() => { done++; onProg && onProg(done, todo.length); })));
+  if (!todo.length) { if (onProg) onProg(1, 1); return; }
+  await Promise.all(todo.map((m) => ensureMonth(m).then(() => { done++; if (onProg) onProg(done, todo.length); })));
 }
 
-// ---------- index (per-month summary, keeps book page counts cheap) ----------
-function parseB(list) {
-  const o = {};
-  for (const s of Array.isArray(list) ? list : []) { const i = String(s).lastIndexOf(':'); if (i > 0) o[s.slice(0, i)] = Number(s.slice(i + 1)) || 0; }
-  return o;
-}
-function monthSummary(m) {
-  let n = 0;
-  const counts = new Map();
-  for (const e of D.entries.values()) {
-    if (e._m !== m) continue;
-    n++;
-    for (const id of Y.linkedBookIds(e, null)) counts.set(id, (counts.get(id) || 0) + 1);
-  }
-  return { n, b: Array.from(counts, ([k, v]) => `${k}:${v}`).sort() };
-}
-const idxTimers = new Map();
+// ---------- index: per-month counts kept on this device (book page counts, older months) ----------
+const touched = new Set();
+let idxTimer = 0, idxSaveTimer = 0;
 function touchMonth(m) {
-  if (!m) return;
-  clearTimeout(idxTimers.get(m));
-  idxTimers.set(m, setTimeout(() => commitMonth(m), 900));
+  if (!m || !/^\d{4}-\d{2}$/.test(m)) return;
+  touched.add(m);
+  clearTimeout(idxTimer);
+  idxTimer = setTimeout(recountTouched, 80);
 }
-function commitMonth(m) {
-  idxTimers.delete(m);
-  if (!monthReady(m)) { ensureMonth(m, false).then(() => touchMonth(m)); return; }
-  const sum = monthSummary(m);
-  const prev = D.index.months[m];
-  if (prev && JSON.stringify(prev) === JSON.stringify(sum)) return;
-  D.index.months[m] = sum;
-  if (D.mode === 'cloud') {
-    D.indexExists = true;
-    enqueue('index', 'update', { months: { [m]: sum } });
-  } else persistLocalSoon();
+async function recountTouched() {
+  const ms = Array.from(touched);
+  touched.clear();
+  for (const m of ms) {
+    let list;
+    if (D.mode === 'device') { try { list = await STORE.byMonth(m); } catch (e) { continue; } }
+    else list = Array.from(memRecs.values()).filter((r) => r.m === m);
+    D.index.months[m] = monthSummary(list.filter((r) => r.k === 'e' && !r.del && r.d));
+    if (!D.index.months[m].n) delete D.index.months[m];
+  }
+  saveIndexSoon();
   scheduleRender();
+}
+function monthSummary(recs) {
+  const b = {};
+  for (const r of recs) for (const id of Y.linkedBookIds(Y.normEntry(r.id, r.d), null)) b[id] = (b[id] || 0) + 1;
+  return { n: recs.length, b };
+}
+function saveIndexSoon() {
+  if (D.mode !== 'device') return;
+  clearTimeout(idxSaveTimer);
+  idxSaveTimer = setTimeout(() => STORE.setMeta('index', D.index).catch(() => {}), 300);
+}
+async function rebuildIndex() {
+  const months = {};
+  await STORE.eachKind('e', (r) => {
+    if (r.del || !r.d) return;
+    const m = r.m || Y.monthOf(r.d.date);
+    const x = months[m] || (months[m] = { n: 0, b: {} });
+    x.n++;
+    for (const id of Y.linkedBookIds(Y.normEntry(r.id, r.d), null)) x.b[id] = (x.b[id] || 0) + 1;
+  });
+  D.index = { v: 3, months };
+  await STORE.setMeta('index', D.index);
 }
 function bookCount(id) {
   let n = 0;
-  for (const m of Object.keys(D.index.months || {})) n += parseB(D.index.months[m].b)[id] || 0;
+  for (const m of Object.keys(D.index.months || {})) n += (D.index.months[m].b || {})[id] || 0;
   return n;
 }
 function totalCount() { let n = 0; for (const v of Object.values(D.index.months || {})) n += Number(v && v.n) || 0; return n; }
 function bookSince(id) { const ms = monthsWithBook(id); return ms.length ? ms[0].replace('-', '.') : ''; }
+
+// ---------- records arriving from other devices (or another tab, a backup, the old version) ----------
+function applyChanges(changes) {
+  let ui = false;
+  for (const c of changes) {
+    if (!c || c.resend || !c.rec) continue;
+    const { old, rec } = c;
+    seenV(rec.v);
+    if (rec.k === 'e') {
+      const oldM = old && !old.del && old.d ? Y.monthOf(Y.normEntry(old.id, old.d).date) : null;
+      if (rec.del || !rec.d) D.entries.delete(rec.id);
+      else {
+        const m = Y.monthOf(Y.normEntry(rec.id, rec.d).date);
+        if (monthReady(m)) putEntryMem(rec.id, rec.d, rec.v); else D.entries.delete(rec.id);
+        touchMonth(m);
+      }
+      if (oldM) touchMonth(oldM);
+      ui = true;
+    } else if (rec.k === 'b') {
+      if (rec.del || !rec.d) D.books.delete(rec.id); else D.books.set(rec.id, Y.normBook(rec.id, rec.d));
+      ui = true;
+    } else if (rec.k === 's' && rec.d && !rec.del) {
+      D.settings = Y.normSettings(rec.d);
+      ui = true;
+    }
+  }
+  if (ui) scheduleRender();
+}
 
 // ---------- entries ----------
 function newEntry(o) {
@@ -1329,35 +1375,35 @@ function saveEntry(entry, opts) {
   if (!e.created) e.created = Date.now();
   const old = D.entries.get(e.id);
   const m = Y.monthOf(e.date);
-  e._m = m;
+  const rec = makeRec('e', e.id, Y.entryDoc(e));
+  e._m = m; e._v = rec.v;
   D.entries.set(e.id, e);
-  enqueue(entryRel(e.id, m), 'set', Y.entryDoc(e));
-  if (old && old._m && old._m !== m) { enqueue(entryRel(e.id, old._m), 'delete'); touchMonth(old._m); }
-  if (!D.months.has(m)) ensureMonth(m, false);
-  touchMonth(m);
+  if (!D.months.has(m)) ensureMonth(m);
+  persist(rec, () => { touchMonth(m); if (old && old._m && old._m !== m) touchMonth(old._m); });
+  FILES.attach(e.files.map((f) => f.id));
   if (!opts.quiet) scheduleRender();
   return e;
 }
 
 function removeEntry(e, keepFiles) {
   D.entries.delete(e.id);
-  enqueue(entryRel(e.id, e._m || Y.monthOf(e.date)), 'delete');
-  touchMonth(e._m || Y.monthOf(e.date));
-  if (!keepFiles) for (const f of e.files || []) deleteAsset(f.id);
+  const m = e._m || Y.monthOf(e.date);
+  persist(tombstone('e', e.id), () => touchMonth(m));
+  if (!keepFiles) for (const f of e.files || []) FILES.remove(f.id);
   scheduleRender();
 }
 
 function saveBook(b) {
   const nb = Y.normBook(b.id, b);
   D.books.set(nb.id, nb);
-  enqueue('b-' + nb.id, 'set', Y.bookDoc(nb));
+  persist(makeRec('b', nb.id, Y.bookDoc(nb)));
   scheduleRender();
   return nb;
 }
 
 function removeBook(id) {
   D.books.delete(id);
-  enqueue('b-' + id, 'delete');
+  persist(tombstone('b', id));
   if (D.settings.defaultLedger === id) { const l = ledgers()[0]; D.settings.defaultLedger = l ? l.id : ''; saveSettings(); }
   scheduleRender();
 }
@@ -1365,13 +1411,7 @@ function removeBook(id) {
 let setTimer = 0;
 function saveSettings() {
   clearTimeout(setTimer);
-  setTimer = setTimeout(() => enqueue('settings', 'set', clone(D.settings)), 250);
-  if (D.mode !== 'cloud') persistLocalSoon();
-}
-
-function deleteAsset(id) {
-  if (!CAP.assets || !id) return;
-  CAP.assets.delete(id).catch((e) => console.warn('[엮음] asset delete failed', e));
+  setTimer = setTimeout(() => persist(makeRec('s', 'main', clone(D.settings))), 250);
 }
 
 function entriesBetween(from, to) {
@@ -1398,6 +1438,761 @@ function rangeDates(key, from, to) {
   return null;
 }
 const RANGE_LABEL = { week: '이번 주', month: '이번 달', last: '지난 달', year: '올해', all: '전체', custom: '기간' };
+
+// ---------- other tabs of this app on the same device ----------
+const BUS = (() => {
+  let ch = null;
+  try { ch = new BroadcastChannel('yeokkeum'); } catch (e) { ch = null; }
+  const handlers = [];
+  if (ch) ch.onmessage = (ev) => { for (const h of handlers) { try { h(ev.data || {}); } catch (e) { console.warn(e); } } };
+  return { post(m) { if (ch) { try { ch.postMessage(m); } catch (e) { /* ignore */ } } }, on(h) { handlers.push(h); } };
+})();
+const tabKeys = new Set();
+let tabTimer = 0;
+BUS.on((m) => {
+  if (D.mode !== 'device') return;
+  if (m.t === 'rec' && m.key) {
+    tabKeys.add(m.key);
+    clearTimeout(tabTimer);
+    tabTimer = setTimeout(reloadTabKeys, 120);
+    SYNC.kick();
+  } else if (m.t === 'file') {
+    SYNC.kick();
+    scheduleRender();
+  }
+});
+async function reloadTabKeys() {
+  const keys = Array.from(tabKeys); tabKeys.clear();
+  const changes = [];
+  for (const key of keys) {
+    const rec = await STORE.getRec(key).catch(() => null);
+    if (!rec) continue;
+    let old = null;
+    if (rec.k === 'e') { const cur = D.entries.get(rec.id); if (cur && (cur._v || 0) >= rec.v) continue; if (cur) old = { id: cur.id, d: Y.entryDoc(cur), del: 0 }; }
+    changes.push({ old, rec });
+  }
+  applyChanges(changes);
+}
+
+const BACKUP_VIEWER = "<!doctype html>\n<html lang=\"ko\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>엮음 기록 백업</title>\n<style>\n:root{--bg:#F3F4F3;--card:#FFFFFF;--soft:#F6F7F6;--ink:#121815;--ink2:#444F4B;--ink3:#6E7975;--rule:#DCE1DE;--rule2:#B7C0BC;--accent:#22407A;--out:#B0302A;--in:#1B7145;color-scheme:light}\n@media (prefers-color-scheme:dark){:root{--bg:#0E1412;--card:#161D1A;--soft:#1B2320;--ink:#E2E9E5;--ink2:#A7B4AE;--ink3:#7E8B85;--rule:#262F2B;--rule2:#3A4540;--accent:#9CB2EA;--out:#EF8A80;--in:#6FCB97;color-scheme:dark}}\n*{box-sizing:border-box}\nbody{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,\"Apple SD Gothic Neo\",\"Malgun Gothic\",\"Noto Sans KR\",\"Noto Sans CJK KR\",sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}\nheader{background:var(--card);border-bottom:1px solid var(--rule)}\n.in{max-width:860px;margin:0 auto;padding:0 16px}\nh1{font-size:22px;margin:0;padding-top:18px;letter-spacing:-.01em}\n.sub{color:var(--ink3);font-size:13px;margin:2px 0 12px}\nnav{display:flex;gap:4px}\nnav button{border:0;background:none;padding:10px 12px;font:inherit;font-weight:600;color:var(--ink3);border-bottom:2px solid transparent;cursor:pointer}\nnav button[aria-pressed=\"true\"]{color:var(--ink);border-bottom-color:var(--accent)}\n.tools{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 6px}\n.tools input,.tools select{font:inherit;font-size:15px;height:40px;border:1.5px solid var(--rule2);border-radius:9px;background:var(--card);color:var(--ink);padding:0 10px;min-width:0}\n.tools input{flex:1 1 220px}\n.count{color:var(--ink3);font-size:13px;margin:4px 0 0}\nh2{font-size:17px;margin:26px 0 8px;display:flex;align-items:center;gap:10px}\nh2::after{content:\"\";flex:1;height:1px;background:var(--rule)}\n.card{background:var(--card);border:1px solid var(--rule);border-radius:10px;padding:12px 14px;margin:8px 0;display:grid;gap:6px}\n.top{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13px;color:var(--ink3)}\n.top b{color:var(--ink);font-size:14.5px}\n.chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--rule);border-radius:5px;padding:0 7px;font-size:12px;color:var(--ink2);background:var(--soft)}\n.chip i{width:6px;height:12px;border-radius:1.5px;display:inline-block}\n.text{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font-size:15.5px}\n.kv{display:grid;grid-template-columns:minmax(80px,auto) 1fr;gap:2px 12px;font-size:13.5px;margin:0}\n.kv dt{color:var(--ink3)}.kv dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}\n.money{font-size:13.5px;display:grid;gap:1px}\n.money span.o{color:var(--out)}.money span.i{color:var(--in)}\n.num{font-variant-numeric:tabular-nums;white-space:nowrap}\n.files{display:flex;gap:6px;flex-wrap:wrap}\n.files a{display:block;width:88px;height:88px;border-radius:8px;overflow:hidden;border:1px solid var(--rule);background:var(--soft);color:var(--ink2);font-size:11px;text-decoration:none;position:relative}\n.files a img{width:100%;height:100%;object-fit:cover;display:block}\n.files a span{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:4px;overflow-wrap:anywhere}\n.files a.doc{width:auto;min-width:88px;max-width:220px;height:auto;padding:8px 10px}\n.files a.doc span{position:static}\n.more{display:block;margin:16px auto;font:inherit;padding:10px 18px;border-radius:9px;border:1px solid var(--rule2);background:var(--card);color:var(--ink);cursor:pointer}\n.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-top:12px}\n.grid a{display:block;background:var(--card);border:1px solid var(--rule);border-radius:8px;overflow:hidden;text-decoration:none;color:var(--ink2);font-size:12px}\n.grid a img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:var(--soft)}\n.grid a div{padding:4px 7px}\n.tw{overflow-x:auto;background:var(--card);border:1px solid var(--rule);border-radius:10px;margin-top:12px}\ntable{border-collapse:collapse;width:100%;font-size:13.5px}\nth,td{padding:8px 10px;border-bottom:1px solid var(--rule);text-align:left;vertical-align:top}\nth{background:var(--soft);font-weight:600;color:var(--ink2);white-space:nowrap;font-size:12.5px}\ntd.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}\ntd.m{min-width:14em;color:var(--ink2)}\ntfoot td{font-weight:700;border-top:2px solid var(--ink3)}\n.miss{color:var(--ink3);font-size:12px}\nfooter{color:var(--ink3);font-size:12.5px;padding:28px 0 40px;text-align:center}\n@media print{header nav,.tools,.more{display:none}body{background:#fff}.card{break-inside:avoid}}\n</style>\n</head>\n<body>\n<header><div class=\"in\"><h1>엮음 기록 백업</h1><p class=\"sub\" id=\"sub\"></p><nav id=\"nav\"><button type=\"button\" data-v=\"log\" aria-pressed=\"true\">기록</button><button type=\"button\" data-v=\"book\" aria-pressed=\"false\">책</button><button type=\"button\" data-v=\"photo\" aria-pressed=\"false\">사진</button></nav></div></header>\n<main class=\"in\" id=\"main\"></main>\n<footer class=\"in\">이 파일은 엮음 앱이나 인터넷 없이도 열려요. 사진과 파일은 같은 폴더의 files 폴더에 있어요.<br>엮음 앱의 설정 → ‘백업으로 복원’에서 이 압축 파일을 고르면 기록을 다시 넣을 수 있어요.</footer>\n<!--DATA-->\n<script>\n(function () {\n  'use strict';\n  var B = JSON.parse(document.getElementById('yk-data').textContent);\n  var DOW = ['일', '월', '화', '수', '목', '금', '토'];\n  var books = {}; (B.books || []).forEach(function (b) { books[b.id] = b; });\n  var files = B.files || {};\n  var entries = (B.entries || []).slice().sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : (b.ts || 0) - (a.ts || 0); });\n  var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>\"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]; }); };\n  var won = function (n) { return Math.round(Number(n) || 0).toLocaleString('ko-KR'); };\n  var pd = function (s) { var p = String(s).split('-').map(Number); return new Date(p[0], (p[1] || 1) - 1, p[2] || 1); };\n  function dayLabel(e) {\n    var d = pd(e.date);\n    if (e.per === 'm') return d.getFullYear() + '년 ' + (d.getMonth() + 1) + '월 월간';\n    if (e.per === 'w') { var t = new Date(d); t.setDate(t.getDate() + 6); return (d.getMonth() + 1) + '.' + d.getDate() + ' – ' + (t.getMonth() + 1) + '.' + t.getDate() + ' 주간'; }\n    return (d.getMonth() + 1) + '월 ' + d.getDate() + '일 ' + DOW[d.getDay()] + '요일';\n  }\n  function timeOf(e) { if (e.per && e.per !== 'd') return ''; var d = new Date(e.ts || 0); if (!e.ts) return ''; return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }\n  function fieldsOf(b) { var t = (b && b.tpl) || {}; return [].concat(t.d || [], t.w || [], t.m || []); }\n  function fmt(f, v) { if (v == null || v === '') return ''; if (f.type === 'money') return won(v) + '원'; if (f.type === 'num') return v + (f.unit || ''); if (f.type === 'check') return v ? '예' : '아니요'; return String(v); }\n  function slotSum(e, bid, fid) { var k = bid + '|' + fid, s = 0, hit = false; (e.money || []).forEach(function (m) { if ((m.slots || []).indexOf(k) >= 0) { s += m.amount; hit = true; } }); return hit ? s : null; }\n  function linked(e) { var ids = Object.keys(e.links || {}); (e.money || []).forEach(function (m) { (m.ledgers || []).forEach(function (l) { if (ids.indexOf(l) < 0) ids.push(l); }); }); return ids.filter(function (id) { return books[id]; }); }\n  function fileLink(f) {\n    var x = files[f.id];\n    var label = esc(f.label || f.name || '파일');\n    if (!x || !x.path) return '<a class=\"doc\" href=\"#\" onclick=\"return false\"><span>' + label + '<br><span class=\"miss\">원본 없음</span></span></a>';\n    var href = esc(x.path);\n    var missing = x.part && B.part && x.part !== B.part ? ' title=\"백업 ' + x.part + '번 파일에 있어요\"' : '';\n    if (/^image\\/(jpeg|png|webp|gif)/.test(x.type || f.type || '')) return '<a href=\"' + href + '\" target=\"_blank\"' + missing + '><img loading=\"lazy\" src=\"' + href + '\" alt=\"' + label + '\" onerror=\"this.replaceWith(Object.assign(document.createElement(\\'span\\'),{textContent:\\'' + (x.part && B.part && x.part !== B.part ? '백업 ' + x.part + '번 파일' : '사진') + '\\'}))\"></a>';\n    return '<a class=\"doc\" href=\"' + href + '\" target=\"_blank\"' + missing + '><span>' + label + '</span></a>';\n  }\n  function card(e) {\n    var h = '<article class=\"card\"><div class=\"top\"><b>' + esc(dayLabel(e)) + '</b>' + (timeOf(e) ? '<span class=\"num\">' + timeOf(e) + '</span>' : '');\n    linked(e).forEach(function (id) { var b = books[id]; h += '<span class=\"chip\"><i style=\"background:' + esc(b.color) + '\"></i>' + esc(b.name) + '</span>'; });\n    h += '</div>';\n    if (e.text) h += '<p class=\"text\">' + esc(e.text) + '</p>';\n    Object.keys(e.links || {}).forEach(function (bid) {\n      var b = books[bid]; if (!b || b.kind !== 'note') return;\n      var rows = ''; ((b.tpl || {})[e.per || 'd'] || []).forEach(function (f) { var v = f.type === 'money' ? slotSum(e, bid, f.id) : (e.links[bid] || {})[f.id]; var s = fmt(f, v); if (s) rows += '<dt>' + esc(f.name) + '</dt><dd>' + esc(s) + '</dd>'; });\n      if (rows) h += '<dl class=\"kv\">' + rows + '</dl>';\n    });\n    if ((e.money || []).length) h += '<div class=\"money\">' + e.money.map(function (m) { return '<div>' + esc(m.label || '') + (m.cat && m.cat !== m.label ? ' · ' + esc(m.cat) : '') + ' <span class=\"num ' + (m.dir === 'in' ? 'i' : 'o') + '\">' + (m.dir === 'in' ? '+' : '−') + won(m.amount) + '원</span></div>'; }).join('') + '</div>';\n    if ((e.files || []).length) h += '<div class=\"files\">' + e.files.map(fileLink).join('') + '</div>';\n    return h + '</article>';\n  }\n  var view = 'log', q = '', bf = '', shown = 300;\n  var main = document.getElementById('main');\n  function matches(e) {\n    if (bf && linked(e).indexOf(bf) < 0) return false;\n    if (!q) return true;\n    var hay = [e.text, e.date].concat((e.money || []).map(function (m) { return m.label + ' ' + m.amount; })).concat(Object.keys(e.links || {}).map(function (k) { var v = e.links[k]; return Object.keys(v).map(function (x) { return v[x]; }).join(' '); })).join(' ').toLowerCase();\n    return q.split(/\\s+/).every(function (t) { return hay.indexOf(t) >= 0; });\n  }\n  function bookOptions(onlyKind) { return '<option value=\"\">모든 책</option>' + (B.books || []).filter(function (b) { return !onlyKind || b.kind === onlyKind; }).map(function (b) { return '<option value=\"' + esc(b.id) + '\"' + (bf === b.id ? ' selected' : '') + '>' + esc(b.name) + '</option>'; }).join(''); }\n  function renderLog() {\n    var list = entries.filter(matches);\n    var h = '<div class=\"tools\"><input id=\"q\" type=\"search\" placeholder=\"찾기: 현장명, 금액, 단어\" value=\"' + esc(q) + '\"><select id=\"bf\">' + bookOptions() + '</select></div><p class=\"count\">' + list.length + '개 기록</p>';\n    var last = '';\n    list.slice(0, shown).forEach(function (e) { var m = e.date.slice(0, 7); if (m !== last) { h += '<h2>' + m.slice(0, 4) + '년 ' + Number(m.slice(5)) + '월</h2>'; last = m; } h += card(e); });\n    if (list.length > shown) h += '<button class=\"more\" type=\"button\" id=\"more\">더 보기 (' + (list.length - shown) + '개 남음)</button>';\n    main.innerHTML = h;\n  }\n  function renderBook() {\n    var b = books[bf] || (B.books || [])[0];\n    if (!b) { main.innerHTML = '<p class=\"count\">책이 없어요.</p>'; return; }\n    bf = b.id;\n    var list = entries.filter(function (e) { return linked(e).indexOf(b.id) >= 0; }).slice().reverse();\n    var h = '<div class=\"tools\"><select id=\"bf\">' + (B.books || []).map(function (x) { return '<option value=\"' + esc(x.id) + '\"' + (x.id === b.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; }).join('') + '</select></div><p class=\"count\">' + list.length + '개 기록</p>';\n    if (b.kind === 'ledger') {\n      var tin = 0, tout = 0, rows = '';\n      list.forEach(function (e) { (e.money || []).forEach(function (m) { if ((m.ledgers || []).indexOf(b.id) < 0) return; if (m.dir === 'in') tin += m.amount; else tout += m.amount; rows += '<tr><td class=\"num\">' + esc(e.date) + '</td><td>' + esc(m.label) + '</td><td>' + esc(m.cat || '') + '</td><td class=\"n\">' + (m.dir === 'in' ? won(m.amount) : '') + '</td><td class=\"n\">' + (m.dir === 'in' ? '' : won(m.amount)) + '</td><td class=\"m\">' + esc((e.text || '').slice(0, 80)) + '</td></tr>'; }); });\n      h += '<div class=\"tw\"><table><thead><tr><th>날짜</th><th>항목</th><th>분류</th><th class=\"n\">수입</th><th class=\"n\">지출</th><th>메모</th></tr></thead><tbody>' + rows + '</tbody><tfoot><tr><td>합계</td><td></td><td></td><td class=\"n\">' + won(tin) + '</td><td class=\"n\">' + won(tout) + '</td><td></td></tr></tfoot></table></div>';\n    } else {\n      var fs = ((b.tpl || {}).d || []);\n      var sums = fs.map(function () { return 0; });\n      var rows2 = list.filter(function (e) { return (e.per || 'd') === 'd'; }).map(function (e) {\n        return '<tr><td class=\"num\">' + esc(e.date) + '</td>' + fs.map(function (f, i) { var v = f.type === 'money' ? slotSum(e, b.id, f.id) : ((e.links || {})[b.id] || {})[f.id]; if ((f.type === 'num' || f.type === 'money') && v != null && v !== '' && isFinite(Number(v))) sums[i] += Number(v); return '<td' + (f.type === 'num' || f.type === 'money' ? ' class=\"n\"' : '') + '>' + esc(fmt(f, v)) + '</td>'; }).join('') + '<td class=\"m\">' + esc((e.text || '').slice(0, 80)) + '</td></tr>';\n      }).join('');\n      h += '<div class=\"tw\"><table><thead><tr><th>날짜</th>' + fs.map(function (f) { return '<th' + (f.type === 'num' || f.type === 'money' ? ' class=\"n\"' : '') + '>' + esc(f.name) + '</th>'; }).join('') + '<th>메모</th></tr></thead><tbody>' + rows2 + '</tbody><tfoot><tr><td>합계</td>' + fs.map(function (f, i) { return '<td class=\"n\">' + (f.type === 'num' ? sums[i] + (f.unit || '') : f.type === 'money' ? won(sums[i]) + '원' : '') + '</td>'; }).join('') + '<td></td></tr></tfoot></table></div>';\n    }\n    main.innerHTML = h;\n  }\n  function renderPhotos() {\n    var items = [];\n    entries.forEach(function (e) { (e.files || []).forEach(function (f) { var x = files[f.id]; if (x && x.path && /^image\\//.test(x.type || f.type || '')) items.push({ e: e, f: f, x: x }); }); });\n    var h = '<p class=\"count\" style=\"margin-top:14px\">사진 ' + items.length + '장</p><div class=\"grid\">';\n    items.slice(0, shown).forEach(function (it) { h += '<a href=\"' + esc(it.x.path) + '\" target=\"_blank\"><img loading=\"lazy\" src=\"' + esc(it.x.path) + '\" alt=\"\"><div>' + esc(it.e.date) + (it.f.label ? ' · ' + esc(it.f.label) : '') + '</div></a>'; });\n    h += '</div>';\n    if (items.length > shown) h += '<button class=\"more\" type=\"button\" id=\"more\">더 보기</button>';\n    main.innerHTML = h;\n  }\n  function render() { if (view === 'log') renderLog(); else if (view === 'book') renderBook(); else renderPhotos(); }\n  var d = new Date(B.exportedAt || Date.now());\n  var nFiles = Object.keys(files).filter(function (k) { return files[k].path; }).length;\n  document.getElementById('sub').textContent = d.getFullYear() + '년 ' + (d.getMonth() + 1) + '월 ' + d.getDate() + '일 저장 · 기록 ' + entries.length + '개 · 책 ' + (B.books || []).length + '권' + (nFiles ? ' · 사진·파일 ' + nFiles + '개' : '') + (B.parts > 1 ? ' · 백업 ' + B.part + '/' + B.parts + '번 파일' : '');\n  document.getElementById('nav').addEventListener('click', function (ev) { var b = ev.target.closest('button'); if (!b) return; view = b.dataset.v; shown = 300; if (view === 'book' && !bf) bf = ''; Array.prototype.forEach.call(document.querySelectorAll('nav button'), function (x) { x.setAttribute('aria-pressed', String(x === b)); }); render(); });\n  main.addEventListener('input', function (ev) { if (ev.target.id === 'q') { q = ev.target.value.trim().toLowerCase().replace(/,/g, ''); shown = 300; clearTimeout(main._t); main._t = setTimeout(function () { var pos = ev.target.selectionStart; render(); var n = document.getElementById('q'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch (x) {} } }, 150); } });\n  main.addEventListener('change', function (ev) { if (ev.target.id === 'bf') { bf = ev.target.value; render(); } });\n  main.addEventListener('click', function (ev) { if (ev.target.id === 'more') { shown += 300; render(); } });\n  render();\n})();\n</script>\n</body>\n</html>\n";
+// ================= this device's store: the original of every record and file lives here (IndexedDB) =================
+// rec  : entries (k 'e'), books (k 'b'), settings (k 's'). {key, k, id, v, dv, del, d, m?, dirty?}
+//        v/dv = version (time-based clock + device id). The newer version always wins, on every device.
+// file : attachments with their bytes. {id, name, type, size, created, blob, att, pend, gone}
+// cf   : what the Google relay currently holds for each file (mirror of the cloud file list)
+// meta : small values (device id, clock, index of months, sync positions …)
+const STORE = (() => {
+  const NAME = 'yeokkeum';
+  let db = null;
+  const rq = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const done = (t) => new Promise((res, rej) => { t.oncomplete = () => res(); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('aborted')); });
+  const os = (name) => db.transaction([name], 'readonly').objectStore(name);
+
+  function open() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) { reject(new Error('no-idb')); return; }
+      let r;
+      try { r = indexedDB.open(NAME, 1); } catch (e) { reject(e); return; }
+      r.onupgradeneeded = () => {
+        const d = r.result;
+        const rec = d.createObjectStore('rec', { keyPath: 'key' });
+        rec.createIndex('m', 'm');
+        rec.createIndex('k', 'k');
+        rec.createIndex('dirty', 'dirty');
+        const file = d.createObjectStore('file', { keyPath: 'id' });
+        file.createIndex('pend', 'pend');
+        d.createObjectStore('cf', { keyPath: 'id' });
+        d.createObjectStore('meta', { keyPath: 'k' });
+      };
+      r.onsuccess = () => {
+        db = r.result;
+        // another tab is upgrading or wiping the store: let it, this tab reloads
+        db.onversionchange = () => { try { db.close(); } catch (e) { /* ignore */ } setTimeout(() => location.reload(), 200); };
+        resolve();
+      };
+      r.onerror = () => reject(r.error || new Error('idb-open'));
+      r.onblocked = () => reject(new Error('blocked'));
+    });
+  }
+
+  // ---------- meta ----------
+  async function getMeta(k) { const r = await rq(os('meta').get(k)); return r ? r.v : undefined; }
+  function setMeta(k, v) { const t = db.transaction(['meta'], 'readwrite'); t.objectStore('meta').put({ k, v }); return done(t); }
+
+  // ---------- records ----------
+  const getRec = (key) => rq(os('rec').get(key));
+  const byMonth = (m) => rq(os('rec').index('m').getAll(m));
+  const byKind = (k) => rq(os('rec').index('k').getAll(k));
+  const dirty = (n) => rq(os('rec').index('dirty').getAll(1, n || 100));
+  const countDirty = () => rq(os('rec').index('dirty').count(1));
+  const countKind = (k) => rq(os('rec').index('k').count(k));
+
+  function put(rec) { const t = db.transaction(['rec'], 'readwrite'); t.objectStore('rec').put(rec); return done(t); }
+
+  /** Keep whichever version is newer. opt.dirty: what wins here still has to be sent to the relay. */
+  function merge(list, opt) {
+    const markDirty = !!(opt && opt.dirty);
+    return new Promise((resolve, reject) => {
+      const t = db.transaction(['rec'], 'readwrite');
+      const s = t.objectStore('rec');
+      const out = [];
+      for (const r of list) {
+        const g = s.get(r.key);
+        g.onsuccess = () => {
+          const cur = g.result;
+          if (!cur || verNewer(r, cur)) {
+            const next = Object.assign({}, r);
+            if (markDirty) next.dirty = 1; else delete next.dirty;
+            if (!next.m) delete next.m;
+            s.put(next);
+            out.push({ old: cur || null, rec: next });
+          } else if (verSame(cur, r)) {
+            if (cur.dirty && !markDirty) { delete cur.dirty; s.put(cur); }
+          } else if (!markDirty && !cur.dirty) {
+            // the relay holds an older copy than this device: send ours again
+            cur.dirty = 1; s.put(cur); out.push({ resend: true, key: cur.key });
+          }
+        };
+      }
+      t.oncomplete = () => resolve(out);
+      t.onerror = () => reject(t.error);
+      t.onabort = () => reject(t.error || new Error('aborted'));
+    });
+  }
+
+  /** After the relay confirmed: clear the "waiting" mark, unless the record changed again meanwhile. */
+  function clearDirty(list) {
+    const t = db.transaction(['rec'], 'readwrite');
+    const s = t.objectStore('rec');
+    for (const p of list) {
+      const g = s.get(p.key);
+      g.onsuccess = () => { const c = g.result; if (c && c.dirty && verSame(c, p)) { delete c.dirty; s.put(c); } };
+    }
+    return done(t);
+  }
+
+  /** Visit every record of one kind (fn must be synchronous). */
+  function eachKind(k, fn) {
+    return new Promise((resolve, reject) => {
+      const t = db.transaction(['rec'], 'readonly');
+      const r = t.objectStore('rec').index('k').openCursor(IDBKeyRange.only(k));
+      r.onsuccess = () => { const c = r.result; if (c) { fn(c.value); c.continue(); } };
+      t.oncomplete = () => resolve();
+      t.onerror = () => reject(t.error);
+    });
+  }
+
+  // ---------- files ----------
+  const getFile = (id) => rq(os('file').get(id));
+  const pendFiles = () => rq(os('file').index('pend').getAll(1));
+  const allFiles = () => rq(os('file').getAll());
+  function putFile(f) { const t = db.transaction(['file'], 'readwrite'); t.objectStore('file').put(f); return done(t); }
+  function delFile(id) { const t = db.transaction(['file'], 'readwrite'); t.objectStore('file').delete(id); return done(t); }
+  function patchFile(id, patch) {
+    const t = db.transaction(['file'], 'readwrite');
+    const s = t.objectStore('file');
+    const g = s.get(id);
+    g.onsuccess = () => { const f = g.result; if (!f) return; const n = Object.assign(f, patch); for (const k of Object.keys(patch)) if (patch[k] === undefined) delete n[k]; s.put(n); };
+    return done(t);
+  }
+  /** Count and bytes of files kept on this device (without reading their contents). */
+  function fileStats() {
+    return new Promise((resolve, reject) => {
+      const t = db.transaction(['file'], 'readonly');
+      let n = 0, bytes = 0;
+      const r = t.objectStore('file').openCursor();
+      r.onsuccess = () => { const c = r.result; if (c) { const f = c.value; if (f.blob && !f.gone) { n++; bytes += Number(f.size) || 0; } c.continue(); } };
+      t.oncomplete = () => resolve({ n, bytes });
+      t.onerror = () => reject(t.error);
+    });
+  }
+
+  // ---------- relay file list mirror ----------
+  const allCf = () => rq(os('cf').getAll());
+  const getCf = (id) => rq(os('cf').get(id));
+  function putCfs(list) { const t = db.transaction(['cf'], 'readwrite'); const s = t.objectStore('cf'); for (const c of list) s.put(c); return done(t); }
+
+  // ---------- whole store ----------
+  function wipe() {
+    return new Promise((resolve) => {
+      try { db.close(); } catch (e) { /* ignore */ }
+      const r = indexedDB.deleteDatabase(NAME);
+      r.onsuccess = r.onerror = r.onblocked = () => resolve();
+    });
+  }
+
+  return { open, getMeta, setMeta, getRec, byMonth, byKind, dirty, countDirty, countKind, put, merge, clearDirty, eachKind, getFile, pendFiles, allFiles, putFile, delFile, patchFile, fileStats, allCf, getCf, putCfs, wipe };
+})();
+
+function verNewer(a, b) { return a.v > b.v || (a.v === b.v && String(a.dv) > String(b.dv)); }
+function verSame(a, b) { return a.v === b.v && String(a.dv) === String(b.dv); }
+// ================= attachments: the original stays on this device; the relay only carries copies between devices =================
+const FILES = (() => {
+  const mem = new Map(); // used only when this device cannot keep anything
+
+  /** Keep a prepared file on this device. It travels to other devices once it belongs to a saved record. */
+  async function add(p) {
+    const id = randHex(12);
+    const f = { id, name: p.name, type: p.type, size: p.blob.size, created: Date.now(), blob: p.blob, att: 0 };
+    if (D.mode === 'device') await STORE.putFile(f); else mem.set(id, f);
+    return { id, name: p.name, type: p.type, size: p.blob.size, label: '', t: p.thumb || '' };
+  }
+
+  /** The record holding these files was saved: from now on they are sent to the other devices. */
+  function attach(ids) {
+    if (!ids || !ids.length || D.mode !== 'device') return;
+    (async () => {
+      let any = false;
+      for (const id of ids) {
+        const f = await STORE.getFile(id).catch(() => null);
+        if (f && !f.att && !f.gone) { await STORE.patchFile(id, f.blob ? { att: 1, pend: 1 } : { att: 1 }); any = true; }
+      }
+      if (any) { SYNC.kick(); BUS.post({ t: 'file' }); }
+    })().catch((e) => console.warn('[엮음] attach', e));
+  }
+
+  async function local(id) {
+    if (D.mode !== 'device') { const f = mem.get(id); return f && f.blob ? f.blob : null; }
+    const f = await STORE.getFile(id).catch(() => null);
+    return f && f.blob && !f.gone ? f.blob : null;
+  }
+
+  /** This device's copy, or one fetched from the relay right now. Throws {code} when neither is possible. */
+  async function get(id) {
+    const b = await local(id);
+    if (b) return b;
+    if (D.mode !== 'device') throw Object.assign(new Error('missing'), { code: 'missing' });
+    return SYNC.fetchFile(id);
+  }
+
+  async function remove(id) {
+    if (!id) return;
+    if (D.mode !== 'device') { mem.delete(id); return; }
+    const f = await STORE.getFile(id).catch(() => null);
+    if (f && !f.att) { await STORE.delFile(id).catch(() => {}); return; } // never part of a saved record
+    await STORE.putFile({ id, name: f ? f.name : '', type: f ? f.type : '', size: 0, created: f ? f.created : Date.now(), blob: null, att: 1, gone: 1, pend: 1 });
+    SYNC.kick();
+    BUS.post({ t: 'file' });
+  }
+
+  /** Files picked but never saved with a record (app closed mid-way) are dropped after two days. */
+  async function sweep(keep) {
+    if (D.mode !== 'device') return;
+    const all = await STORE.allFiles().catch(() => []);
+    const cut = Date.now() - 2 * 864e5;
+    for (const f of all) if (!f.att && !f.gone && f.created < cut && !keep.has(f.id)) await STORE.delFile(f.id).catch(() => {});
+  }
+
+  return { add, attach, local, get, remove, sweep };
+})();
+// ================= sync: Google's free Firebase only carries changes between this person's devices =================
+// Records: every change goes up once (in a transaction, so an older copy never replaces a newer one) and comes
+// down to the other devices through a listener that asks only for what changed since last time.
+// Files: uploaded in pieces, downloaded by the other devices, and removed from the relay (oldest first) when it
+// nears its limit — but only once a copy is safe on two live devices or in a full backup.
+const SYNC = (() => {
+  const CHUNK = 900000;                 // bytes per relay piece (a Firestore document holds up to 1MiB)
+  let CAP_BYTES = 600 * 1048576;        // relay space for photos and files (the free plan has 1GiB in total)
+  let LOW_BYTES = 450 * 1048576;        // when clearing, go down to this
+  const LIVE_MS = 60 * 864e5;           // a device not seen for 60 days no longer counts as a safe copy
+  const MARGIN = 120000;                // re-read the last two minutes, so nothing slips between two reads
+  let fs = null, base = '', on = false, acct = '';
+  let unsubR = null, unsubF = null;
+  let pull = { r: 0, f: 0 };
+  let devs = null, devList = [], devsAt = 0;
+  const st = { on: false, busy: false, offline: false, quota: 0, denied: false, err: '', up: 0, down: 0, dirty: 0, pendFiles: 0, upBlocked: false, migrating: false, lastOk: 0, lastPull: 0, refused: 0 };
+  const FV = () => firebase.firestore.FieldValue;
+  const metaPath = (id) => `${base}/f/${id}`;
+  const chunkPath = (id, i) => `${base}/f/${id}/c/${String(i).padStart(3, '0')}`;
+  const changed = () => { try { updateSync(); } catch (e) { /* not ready */ } };
+
+  // ---------- record <-> relay document ----------
+  function toCloud(r) {
+    let d = r.del ? '' : JSON.stringify(r.d);
+    if (d.length > 700000 && r.k === 'e') {
+      // a Firestore document holds up to 1MiB: send this one without its small previews (originals still travel)
+      const slim = Object.assign({}, r.d, { files: (r.d.files || []).map((f) => Object.assign({}, f, { t: '' })) });
+      d = JSON.stringify(slim);
+    }
+    return { k: r.k, id: r.id, v: r.v, dv: r.dv, del: !!r.del, d, s: FV().serverTimestamp() };
+  }
+  function fromCloud(key, x) {
+    if (!x) return null;
+    const k = String(x.k || ''), id = String(x.id || '');
+    if (!/^[ebs]$/.test(k) || !id || recKey(k, id) !== key) return null;
+    const r = { key, k, id, v: Number(x.v) || 0, dv: String(x.dv || ''), del: x.del ? 1 : 0, d: null };
+    if (!r.del) {
+      let d;
+      try { d = JSON.parse(String(x.d || '')); } catch (e) { return null; }
+      if (!d || typeof d !== 'object') return null;
+      if (k === 'e') { const e = Y.normEntry(id, d); r.d = Y.entryDoc(e); r.m = Y.monthOf(e.date); }
+      else if (k === 'b') r.d = Y.bookDoc(Y.normBook(id, d));
+      else r.d = Y.normSettings(d);
+    }
+    return r;
+  }
+  function cfFrom(id, x) {
+    return {
+      id, name: String(x.name || '파일'), type: String(x.type || ''), size: Number(x.size) || 0, n: Number(x.n) || 0, created: Number(x.created) || 0,
+      have: Array.isArray(x.have) ? x.have.map(String) : [], want: Array.isArray(x.want) ? x.want.map(String) : [],
+      ev: !!x.ev, del: !!x.del, s: x.s && x.s.toMillis ? x.s.toMillis() : 0,
+    };
+  }
+
+  // ---------- start / stop ----------
+  async function start(f, uid, opts) {
+    if (on) return;
+    fs = f; base = `data/users/${uid}/v3`; on = true;
+    Object.assign(st, { on: true, denied: false, err: '', quota: 0, offline: !navigator.onLine });
+    changed();
+    acct = uid;
+    pull = Object.assign({ r: 0, f: 0 }, (await STORE.getMeta('pull:' + uid)) || {});
+    registerDevice();
+    listen();
+    try { if (!(await STORE.getMeta('v2done:' + uid))) await migrateV2(uid, opts || {}); }
+    catch (e) { st.migrating = false; handleErr(e, 'migrate'); }
+    kick(0);
+  }
+
+  function stop() {
+    on = false; st.on = false;
+    if (unsubR) { try { unsubR(); } catch (e) { /* ignore */ } unsubR = null; }
+    if (unsubF) { try { unsubF(); } catch (e) { /* ignore */ } unsubF = null; }
+    clearTimeout(kickT); clearTimeout(retryT);
+    changed();
+  }
+
+  function registerDevice() {
+    fs.doc(`${base}/d/${DEV.id}`).set({ name: DEV.name, first: DEV.first || Date.now(), last: FV().serverTimestamp() }, { merge: true })
+      .catch((e) => console.warn('[엮음] device', e && e.code));
+  }
+
+  // ---------- listening for changes from other devices ----------
+  let applyChain = Promise.resolve();
+  function listen() {
+    const since = (ms) => firebase.firestore.Timestamp.fromMillis(Math.max(0, (ms || 0) - MARGIN));
+    unsubR = fs.collection(`${base}/r`).where('s', '>', since(pull.r)).orderBy('s').onSnapshot((qs) => {
+      const list = []; let maxS = 0;
+      for (const ch of qs.docChanges()) {
+        if (ch.type === 'removed') continue;
+        const x = ch.doc.data();
+        if (!x || !x.s || !x.s.toMillis) continue;
+        maxS = Math.max(maxS, x.s.toMillis());
+        const r = fromCloud(ch.doc.id, x);
+        if (r) list.push(r);
+      }
+      if (!qs.metadata.fromCache) { st.offline = false; st.lastPull = Date.now(); }
+      const big = qs.size > 1500;
+      applyChain = applyChain.then(async () => {
+        if (list.length) await applyRemote(list);
+        if (maxS > pull.r) { pull.r = maxS; await STORE.setMeta('pull:' + acct, pull); }
+        if (big && on) relisten();
+      }).catch((e) => console.warn('[엮음] apply', e)).finally(changed);
+    }, (e) => listenErr(e));
+    unsubF = fs.collection(`${base}/f`).where('s', '>', since(pull.f)).orderBy('s').onSnapshot((qs) => {
+      const list = []; let maxS = 0;
+      for (const ch of qs.docChanges()) {
+        if (ch.type === 'removed') continue;
+        const x = ch.doc.data();
+        if (!x || !x.s || !x.s.toMillis) continue;
+        maxS = Math.max(maxS, x.s.toMillis());
+        list.push(cfFrom(ch.doc.id, x));
+      }
+      const big = qs.size > 1500;
+      applyChain = applyChain.then(async () => {
+        if (list.length) { await STORE.putCfs(list); fileLaneSoon(); }
+        if (maxS > pull.f) { pull.f = maxS; await STORE.setMeta('pull:' + acct, pull); }
+        if (big && on) relisten();
+      }).catch((e) => console.warn('[엮음] files list', e));
+    }, (e) => listenErr(e));
+  }
+  // a listener keeps every document it has returned in memory; after a large first load, start again from here
+  let relistenT = 0;
+  function relisten() {
+    clearTimeout(relistenT);
+    relistenT = setTimeout(() => {
+      if (!on) return;
+      if (unsubR) { try { unsubR(); } catch (x) { /* ignore */ } unsubR = null; }
+      if (unsubF) { try { unsubF(); } catch (x) { /* ignore */ } unsubF = null; }
+      listen();
+    }, 1500);
+  }
+  function listenErr(e) {
+    const c = (e && e.code) || '';
+    console.warn('[엮음] listen', c, e);
+    if (unsubR) { try { unsubR(); } catch (x) { /* ignore */ } unsubR = null; }
+    if (unsubF) { try { unsubF(); } catch (x) { /* ignore */ } unsubF = null; }
+    if (handleErr(e, 'listen')) return;
+    // listeners end on some errors (quota, network trouble): start them again later
+    setTimeout(() => { if (on && !unsubR) listen(); }, Date.now() < st.quota ? st.quota - Date.now() : 30000);
+  }
+
+  async function applyRemote(list) {
+    for (const r of list) seenV(r.v);
+    const out = await STORE.merge(list);
+    if (out.some((c) => c.resend)) kick();
+    const real = out.filter((c) => !c.resend);
+    if (real.length) applyChanges(real);
+  }
+
+  // ---------- sending this device's changes ----------
+  let kickT = 0, retryT = 0;
+  function kick(ms) {
+    if (!on) return;
+    clearTimeout(kickT);
+    kickT = setTimeout(() => { recLane(); fileLane(); }, ms == null ? 350 : ms);
+  }
+  function schedule(ms) { clearTimeout(retryT); retryT = setTimeout(() => kick(0), ms); }
+
+  let recBusy = false, recAgain = false;
+  async function recLane() {
+    if (!on) return;
+    if (recBusy) { recAgain = true; return; }
+    recBusy = true;
+    try {
+      if (Date.now() >= st.quota && !st.migrating) { await pushRecords(); st.err = ''; }
+    } catch (e) { handleErr(e, 'push'); }
+    finally {
+      recBusy = false; st.busy = false;
+      try { st.dirty = await STORE.countDirty(); } catch (e) { /* ignore */ }
+      changed();
+      if (recAgain) { recAgain = false; setTimeout(recLane, 60); }
+    }
+  }
+
+  async function pushRecords() {
+    for (let round = 0; round < 60 && on; round++) {
+      const all = await STORE.dirty(150);
+      st.dirty = all.length;
+      if (!all.length) return;
+      const list = []; let size = 0;
+      for (const r of all) {
+        const s = r.d ? JSON.stringify(r.d).length : 60;
+        if (list.length && (size + s > 3000000 || list.length >= 100)) break;
+        list.push(r); size += s;
+      }
+      if (!navigator.onLine) { st.offline = true; return; }
+      st.busy = true; changed();
+      let res;
+      try { res = await sendRecs(list); }
+      catch (e) {
+        if (!e || e.code !== 'invalid-argument' || list.length === 1) {
+          if (e && e.code === 'invalid-argument') { console.warn('[엮음] relay refused', list[0].key, e); await STORE.clearDirty(list); st.refused = (st.refused || 0) + 1; continue; }
+          throw e;
+        }
+        // find the one record the relay refuses, send the rest
+        for (const r of list) {
+          try { const one = await sendRecs([r]); await STORE.clearDirty(one.sent); if (one.lost.length) await applyRemote(one.lost); }
+          catch (e2) { if (e2 && e2.code === 'invalid-argument') { console.warn('[엮음] relay refused', r.key, e2); await STORE.clearDirty([r]); st.refused = (st.refused || 0) + 1; } else throw e2; }
+        }
+        continue;
+      }
+      await STORE.clearDirty(res.sent);
+      if (res.lost.length) await applyRemote(res.lost);
+      st.lastOk = Date.now(); st.offline = false;
+    }
+  }
+
+  /** One transaction: read the relay's copies first, write only where this device's copy is newer. */
+  function sendRecs(list) {
+    const refs = list.map((r) => fs.doc(`${base}/r/${r.key}`));
+    return fs.runTransaction(async (t) => {
+      const snaps = await Promise.all(refs.map((ref) => t.get(ref)));
+      const sent = [], lost = [];
+      snaps.forEach((sn, i) => {
+        const loc = list[i];
+        const rem = sn.exists ? fromCloud(sn.id, sn.data()) : null;
+        if (rem && !verNewer(loc, rem)) { if (verNewer(rem, loc)) lost.push(rem); else sent.push(loc); return; }
+        t.set(refs[i], toCloud(loc));
+        sent.push(loc);
+      });
+      return { sent, lost };
+    });
+  }
+
+  // ---------- files ----------
+  let fileBusy = false, fileAgain = false, fileT = 0;
+  function fileLaneSoon() { clearTimeout(fileT); fileT = setTimeout(fileLane, 300); }
+  async function fileLane() {
+    if (!on) return;
+    if (fileBusy) { fileAgain = true; return; }
+    fileBusy = true;
+    try {
+      if (navigator.onLine && Date.now() >= st.quota && !st.migrating) {
+        await sendDeletes();
+        await sendUploads();
+        await serveWants();
+        await fetchMissing();
+        await evict(0);
+      }
+    } catch (e) { handleErr(e, 'files'); }
+    finally {
+      fileBusy = false;
+      try { st.pendFiles = (await STORE.pendFiles()).length; } catch (e) { /* ignore */ }
+      changed();
+      if (fileAgain) { fileAgain = false; setTimeout(fileLane, 100); }
+    }
+  }
+
+  async function usage() {
+    let n = 0;
+    for (const c of await STORE.allCf()) if (!c.ev && !c.del) n += c.size || 0;
+    return n;
+  }
+  /** Files get what the records leave free: the free plan holds 1GiB in total, records (with their
+      search indexes) take about 6KB each, and a margin stays unused. */
+  let capCache = { at: 0, v: 0 };
+  async function capNow() {
+    if (Date.now() - capCache.at < 600000) return capCache.v;
+    let n = 0;
+    try { n = (await STORE.countKind('e')) + (await STORE.countKind('b')) + 1; } catch (e) { n = 0; }
+    const v = Math.max(100 * 1048576, Math.min(CAP_BYTES, 1024 * 1048576 - 60 * 1048576 - n * 6144));
+    capCache = { at: Date.now(), v: Math.min(v, CAP_BYTES) };
+    return capCache.v;
+  }
+
+  async function sendDeletes() {
+    for (const f of await STORE.pendFiles()) {
+      if (!on) return;
+      if (!f.gone) continue;
+      const c = await STORE.getCf(f.id);
+      let n = c ? c.n : 0;
+      if (!c) { const qs = await fs.collection(`${base}/f/${f.id}/c`).get(); n = qs.size ? Math.max(...qs.docs.map((d) => Number(d.id) || 0)) + 1 : 0; }
+      if (!c || !c.del) {
+        for (let i = 0; i < n; i += 400) {
+          const b = fs.batch();
+          for (let j = i; j < Math.min(n, i + 400); j++) b.delete(fs.doc(chunkPath(f.id, j)));
+          await b.commit();
+        }
+        await fs.doc(metaPath(f.id)).set({ del: true, ev: true, s: FV().serverTimestamp() }, { merge: true });
+      }
+      await STORE.delFile(f.id);
+    }
+  }
+
+  async function upload(f) {
+    const u8 = new Uint8Array(await f.blob.arrayBuffer());
+    const n = Math.max(1, Math.ceil(u8.length / CHUNK));
+    for (let i = 0; i < n; i += 8) {
+      const b = fs.batch();
+      for (let j = i; j < Math.min(n, i + 8); j++) b.set(fs.doc(chunkPath(f.id, j)), { b: firebase.firestore.Blob.fromUint8Array(u8.slice(j * CHUNK, (j + 1) * CHUNK)) });
+      await b.commit();
+    }
+    await fs.doc(metaPath(f.id)).set({ name: f.name || '파일', type: f.type || '', size: u8.length, n, created: f.created || Date.now(), have: FV().arrayUnion(DEV.id), want: [], ev: false, del: false, s: FV().serverTimestamp() }, { merge: true });
+  }
+
+  async function roomFor(size) {
+    const cap = await capNow();
+    if ((await usage()) + size <= cap) return true;
+    await evict(size);
+    return (await usage()) + size <= cap;
+  }
+
+  async function sendUploads() {
+    st.upBlocked = false;
+    for (const p of await STORE.pendFiles()) {
+      if (!on) return;
+      if (p.gone) continue;
+      const f = await STORE.getFile(p.id);
+      if (!f || !f.pend || f.gone) continue;
+      if (!f.blob) { await STORE.patchFile(f.id, { pend: undefined }); continue; }
+      if (!(await roomFor(f.size || f.blob.size))) { st.upBlocked = true; continue; }
+      st.up++; changed();
+      try { await upload(f); } finally { st.up--; }
+      await STORE.patchFile(f.id, { pend: undefined });
+    }
+  }
+
+  async function serveWants() {
+    for (const c of await STORE.allCf()) {
+      if (!on) return;
+      if (c.del || !c.ev || !c.want.some((d) => d !== DEV.id)) continue;
+      const f = await STORE.getFile(c.id);
+      if (!f || !f.blob || f.gone) continue;
+      if (!(await roomFor(f.size || f.blob.size))) { st.upBlocked = true; continue; }
+      st.up++; changed();
+      try { await upload(f); } finally { st.up--; }
+    }
+  }
+
+  async function fetchMissing() {
+    const mine = new Map((await STORE.allFiles()).map((f) => [f.id, f]));
+    let n = 0;
+    for (const c of await STORE.allCf()) {
+      if (!on || n >= 24) break;
+      const f = mine.get(c.id);
+      if (c.del) {
+        if (f && !f.gone) { await STORE.delFile(c.id); BUS.post({ t: 'file' }); scheduleRender(); }
+        continue;
+      }
+      if (f && (f.blob || f.gone)) { if (f.blob && !c.have.includes(DEV.id)) await markHave(c.id); continue; }
+      if (c.ev) continue;
+      try { await download(c); n++; } catch (e) { if (e && e.code === 'incomplete') continue; throw e; }
+    }
+  }
+
+  async function markHave(id) {
+    try { await fs.doc(metaPath(id)).update({ have: FV().arrayUnion(DEV.id), want: FV().arrayRemove(DEV.id), s: FV().serverTimestamp() }); }
+    catch (e) { if (!e || e.code !== 'not-found') throw e; }
+  }
+
+  const inflight = new Map();
+  function download(c) {
+    if (inflight.has(c.id)) return inflight.get(c.id);
+    const p = (async () => {
+      st.down++; changed();
+      try {
+        const qs = await fs.collection(`${base}/f/${c.id}/c`).get();
+        const parts = qs.docs.map((d) => ({ i: Number(d.id), b: d.data().b })).filter((x) => x.b && x.b.toUint8Array).sort((a, b) => a.i - b.i);
+        const need = Math.max(1, c.n || 1);
+        if (parts.length < need) throw Object.assign(new Error('incomplete'), { code: 'incomplete' });
+        const blob = new Blob(parts.slice(0, need).map((x) => x.b.toUint8Array()), { type: c.type || 'application/octet-stream' });
+        if (c.size && blob.size !== c.size) throw Object.assign(new Error('incomplete'), { code: 'incomplete' });
+        const cur = await STORE.getFile(c.id);
+        if (cur && cur.gone) return blob;
+        await STORE.putFile({ id: c.id, name: c.name, type: c.type, size: blob.size, created: c.created || Date.now(), blob, att: 1 });
+        BUS.post({ t: 'file' });
+        scheduleRender();
+        markHave(c.id).catch((e) => console.warn('[엮음] have', e && e.code));
+        return blob;
+      } finally { st.down--; inflight.delete(c.id); changed(); }
+    })();
+    inflight.set(c.id, p);
+    return p;
+  }
+
+  /** Make room on the relay: oldest first, only files that are safe elsewhere and nobody is waiting for. */
+  async function evict(need) {
+    const cfs = (await STORE.allCf()).filter((c) => !c.ev && !c.del);
+    let used = cfs.reduce((s, c) => s + (c.size || 0), 0);
+    const cap = await capNow();
+    if (used + (need || 0) <= cap) return;
+    const target = Math.min(Math.round(LOW_BYTES * cap / CAP_BYTES), cap - (need || 0));
+    const live = await liveDevices();
+    const bk = (D.settings && D.settings.bk) || null;
+    const list = cfs.filter((c) => !c.want.length).sort((a, b) => (a.created || 0) - (b.created || 0));
+    for (const c of list) {
+      if (!on || used <= target) break;
+      const copies = c.have.filter((d) => live.has(d)).length;
+      const backed = !!(bk && bk.at && (c.created || 0) <= bk.at && c.have.includes(bk.dev));
+      if (copies < 2 && !backed) continue;
+      for (let i = 0; i < Math.max(1, c.n); i += 400) {
+        const b = fs.batch();
+        for (let j = i; j < Math.min(Math.max(1, c.n), i + 400); j++) b.delete(fs.doc(chunkPath(c.id, j)));
+        await b.commit();
+      }
+      await fs.doc(metaPath(c.id)).set({ ev: true, s: FV().serverTimestamp() }, { merge: true });
+      await STORE.putCfs([Object.assign({}, c, { ev: true })]);
+      used -= c.size || 0;
+    }
+  }
+
+  async function liveDevices() {
+    if (devs && Date.now() - devsAt < 600000) return devs;
+    const qs = await fs.collection(`${base}/d`).get();
+    const now = Date.now();
+    devs = new Set(); devList = [];
+    for (const d of qs.docs) {
+      const x = d.data() || {};
+      const last = x.last && x.last.toMillis ? x.last.toMillis() : 0;
+      devList.push({ id: d.id, name: String(x.name || '기기'), last, first: Number(x.first) || 0 });
+      if (now - last < LIVE_MS) devs.add(d.id);
+    }
+    devsAt = now;
+    return devs;
+  }
+
+  // ---------- one file, right now (opening a photo whose original is not on this device yet) ----------
+  async function fetchFile(id) {
+    if (!on) throw Object.assign(new Error('signed-out'), { code: 'signed-out' });
+    let c = await STORE.getCf(id);
+    if (!c) {
+      const sn = await fs.doc(metaPath(id)).get();
+      if (sn.exists) { c = cfFrom(id, sn.data()); await STORE.putCfs([c]); }
+    }
+    if (!c) throw Object.assign(new Error('notyet'), { code: 'notyet' });
+    if (c.del) throw Object.assign(new Error('deleted'), { code: 'deleted' });
+    if (c.ev) throw Object.assign(new Error('evicted'), { code: 'evicted', wanted: c.want.includes(DEV.id) });
+    return download(c);
+  }
+
+  async function requestFile(id) {
+    if (!on) throw Object.assign(new Error('signed-out'), { code: 'signed-out' });
+    await fs.doc(metaPath(id)).update({ want: FV().arrayUnion(DEV.id), s: FV().serverTimestamp() });
+  }
+
+  async function info() {
+    const cfs = await STORE.allCf();
+    let bytes = 0, n = 0, ev = 0;
+    for (const c of cfs) { if (c.del) continue; if (c.ev) ev++; else { n++; bytes += c.size || 0; } }
+    let list = devList;
+    if (on) { try { await liveDevices(); list = devList; } catch (e) { /* offline */ } }
+    return { bytes, n, ev, cap: await capNow(), devices: list.slice().sort((a, b) => b.last - a.last) };
+  }
+
+  // ---------- the old version (2.x) kept everything in the relay: bring it to this device once ----------
+  async function migrateV2(uid, opts) {
+    const marker = fs.doc(`${base}/x/migr`);
+    const ms = await marker.get();
+    if (ms.exists) { await STORE.setMeta('v2done:' + uid, { at: Date.now(), by: 'other' }); return; }
+    st.migrating = true; changed();
+    if (opts.flush && fs.waitForPendingWrites) { try { await Promise.race([fs.waitForPendingWrites(), new Promise((r) => setTimeout(r, 15000))]); } catch (e) { /* ignore */ } }
+    const root = `data/users/${uid}`;
+    const top = await fs.collection(root).get();
+    const recs = [];
+    let index = null;
+    const v2 = (k, id, d, t) => { const r = { key: recKey(k, id), k, id, v: Math.max(2, Number(t) || 2), dv: 'v2', del: 0, d }; if (k === 'e') r.m = Y.monthOf(d.date); return r; };
+    for (const d of top.docs) {
+      const x = d.data() || {};
+      if (d.id === 'settings') recs.push(v2('s', 'main', Y.normSettings(x), x.created));
+      else if (d.id === 'index') index = x;
+      else if (d.id.startsWith('b-')) { const id = d.id.slice(2); if (id) recs.push(v2('b', id, Y.bookDoc(Y.normBook(id, x)), x.created)); }
+    }
+    const months = new Set(Object.keys((index && index.months) || {}));
+    const m0 = Y.monthOf(Y.today());
+    months.add(m0); months.add(Y.addMonths(m0, -1));
+    for (const m of months) {
+      if (!/^\d{4}-\d{2}$/.test(m)) continue;
+      const qs = await fs.collection(`${root}/m${m}/e`).get();
+      for (const d of qs.docs) { const e = Y.normEntry(d.id, d.data()); recs.push(v2('e', d.id, Y.entryDoc(e), e.updated || e.created)); }
+    }
+    const fq = await fs.collection(`${root}/files/f`).get();
+    for (const d of fq.docs) {
+      const x = d.data() || {};
+      try {
+        if (await STORE.getFile(d.id)) continue;
+        const cq = await fs.collection(`${root}/files/f/${d.id}/c`).get();
+        const parts = cq.docs.map((c) => c.data() || {}).sort((a, b) => (a.i || 0) - (b.i || 0));
+        const bin = atob(parts.map((p) => String(p.d || '')).join(''));
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        await STORE.putFile({ id: d.id, name: String(x.name || '파일'), type: String(x.type || ''), size: u8.length, created: Number(x.created) || Date.now(), blob: new Blob([u8], { type: String(x.type || 'application/octet-stream') }), att: 1, pend: 1 });
+      } catch (e) { console.warn('[엮음] old file', d.id, e); }
+    }
+    const out = await STORE.merge(recs, { dirty: true });
+    applyChanges(out);
+    await marker.set({ at: FV().serverTimestamp(), by: DEV.id, n: recs.length });
+    await STORE.setMeta('v2done:' + uid, { at: Date.now(), n: recs.length });
+    st.migrating = false; changed();
+    if (recs.length > 7) toast(`이전 버전 기록 ${recs.length}개를 이 기기로 옮겼어요.`, { long: true });
+  }
+
+  // ---------- errors ----------
+  function handleErr(e, where) {
+    const c = (e && e.code) || '';
+    console.warn('[엮음] sync', where, c, e);
+    if (c === 'permission-denied' || c === 'unauthenticated') { st.denied = true; stop(); changed(); return true; }
+    if (c === 'resource-exhausted') { st.quota = Date.now() + 3600e3; schedule(3600e3); changed(); return false; }
+    if (!navigator.onLine || c === 'unavailable' || c === 'deadline-exceeded' || /offline/i.test(String(e && e.message))) { st.offline = true; schedule(30000); changed(); return false; }
+    st.err = c || 'error'; schedule(90000); changed(); return false;
+  }
+
+  window.addEventListener('online', () => { st.offline = false; changed(); kick(0); });
+  window.addEventListener('offline', () => { st.offline = true; changed(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && on) { kick(0); if (Date.now() - devsAt > 6 * 3600e3) { registerDevice(); devsAt = 0; } } });
+
+  return { start, stop, kick, state: () => st, fetchFile, requestFile, info, isOn: () => on, fileLane, cap: () => CAP_BYTES, _test: { setCap(b, low) { CAP_BYTES = b; LOW_BYTES = low; devsAt = 0; capCache = { at: Date.now(), v: b }; } } };
+})();
 // ================= rendering =================
 function render() {
   renderChrome();
@@ -1418,21 +2213,29 @@ function setHtml(el, html) { if (el && el._h !== html) { el.innerHTML = html; el
 
 function syncHtml() { return '<button class="sync" type="button" data-a="syncTap" data-sync data-s="boot"><i></i><span></span></button>'; }
 function syncState() {
-  if (!D.ready) return ['boot', '불러오는 중'];
-  if (D.failed.size) return ['err', '저장 실패 · 다시 시도'];
-  if (D.mode === 'local') return ['local', '이 기기에만 저장'];
-  if (D.mode === 'memory') return ['local', '저장 안 됨'];
-  if (!navigator.onLine) return ['busy', D.pending > 0 ? '오프라인 · 연결되면 저장' : '오프라인'];
-  if (D.pending > 0 || Q.size > 0) return ['busy', '저장 중'];
-  return ['ok', '저장됨'];
+  if (!D.ready) return ['boot', '불러오는 중', ''];
+  if (D.mode === 'memory') return ['err', '저장 안 됨', '이 화면에서는 기록을 기기에 저장할 수 없어요.'];
+  if (D.saveErr) return ['err', '저장 실패', '이 기기에 저장하지 못했어요. 저장 공간을 확인해 주세요.'];
+  if (D.pendingLocal > 0) return ['busy', '저장 중', '이 기기에 저장하는 중이에요.'];
+  if (!D.user) return ['local', '이 기기에 저장됨', '기록은 이 기기에 저장됐어요. 로그인하면 다른 기기와 맞춰져요.'];
+  const s = SYNC.state();
+  if (s.denied) return ['err', '동기화 멈춤', '계정 권한 문제로 동기화가 멈췄어요.'];
+  if (s.migrating) return ['busy', '옮기는 중', '이전 버전의 기록을 이 기기로 옮기는 중이에요.'];
+  const waiting = (s.dirty || 0) + (s.pendFiles || 0);
+  if (!navigator.onLine || s.offline) return ['busy', '오프라인', waiting ? `이 기기에 저장됐어요. 인터넷이 연결되면 다른 기기로 전달돼요 (대기 ${waiting}개).` : '이 기기에 저장됐어요. 인터넷이 연결되면 다른 기기와 맞춰져요.'];
+  if (Date.now() < s.quota) return ['busy', '한도 초과', '오늘 무료 사용량을 다 써서, 한도가 다시 채워지면 이어서 전달해요. 기록은 이 기기에 저장돼 있어요.'];
+  if (s.err) return ['err', '동기화 오류', '잠시 후 다시 시도해요. 기록은 이 기기에 저장돼 있어요.'];
+  if (s.busy || s.up || waiting) return ['busy', '전달 중', '다른 기기로 전달하는 중이에요.'];
+  if (s.down) return ['busy', '받는 중', '다른 기기의 사진·파일을 받는 중이에요.'];
+  return ['ok', '동기화됨', '이 기기에 저장됐고 다른 기기와도 맞춰졌어요.'];
 }
 function updateSync() {
-  const [s, label] = syncState();
+  const [s, label, long] = syncState();
   for (const el of $$('[data-sync]')) {
     if (el.dataset.s !== s) el.dataset.s = s;
     const sp = el.querySelector('span');
     if (sp && sp.textContent !== label) sp.textContent = label;
-    el.title = label;
+    if (el.title !== (long || label)) el.title = long || label;
   }
 }
 
@@ -1515,7 +2318,6 @@ function renderComposer() {
   const ph = S.pendFiles.map((f) => `<span><b>${esc(f.name)}</b><button class="ibtn sm" type="button" data-a="cmpUnfile" data-id="${esc(f.id)}" aria-label="${esc(f.name)} 빼기">${ic('x')}</button></span>`).join('') + (S.uploading ? `<span><span class="spin"></span><b>올리는 중 ${S.uploading}개</b></span>` : '');
   pend.hidden = !ph;
   setHtml(pend, ph);
-  $('#cmp-attach').hidden = !CAP.assets;
   updateSendState();
 }
 function updateSendState() {
@@ -1577,11 +2379,29 @@ function renderLog() {
   return html + '</div>';
 }
 
+const hidden = (k) => { const t = LS.get(k); return !!(t && Date.now() < t); };
+const hideFor = (k, days) => LS.set(k, Date.now() + days * 864e5);
+
+function backupDue() {
+  if (D.mode !== 'device' || totalCount() < 15 || hidden('yk:hideBackup')) return null;
+  const last = Math.max(Number(LS.get('yk:lastBackup')) || 0, (D.settings.bk && D.settings.bk.at) || 0, D.settings.bkAny || 0);
+  if (last && Date.now() - last < 30 * 864e5) return null;
+  return last ? Math.floor((Date.now() - last) / 864e5) : -1;
+}
+
 function logBanners(all) {
   let h = '';
-  if (D.mode === 'local') h += `<div class="banner warn"><span class="grow">아직 계정 저장소에 연결되지 않아 기록이 <b>이 기기에만</b> 저장돼요.</span></div>`;
-  if (D.mode === 'memory') h += `<div class="banner warn"><span class="grow">저장소를 쓸 수 없는 화면이에요. 새로고침하면 쓴 기록이 사라져요.</span></div>`;
-  if (!isStandalone() && !LS.get('yk:hideInstall') && D.mode === 'cloud') h += `<div class="banner"><span class="grow">홈 화면에 설치하면 아이콘을 눌러 바로 열 수 있어요.</span><button class="btn sm pri" type="button" data-a="install">설치</button><button class="ibtn sm" type="button" data-a="hideInstall" aria-label="닫기">${ic('x')}</button></div>`;
+  const warn = (msg, btn) => `<div class="banner warn"><span class="grow">${msg}</span>${btn || ''}</div>`;
+  if (D.mode === 'memory') h += warn('이 화면에서는 기록을 기기에 저장할 수 없어요(비공개 창 등). 창을 닫으면 사라져요. 일반 크롬 창에서 열거나 홈 화면에 설치해 주세요.');
+  if (D.saveErr) h += warn('최근 기록을 이 기기에 저장하지 못했어요. 휴대폰 저장 공간을 확인한 뒤 앱을 다시 열어 주세요.');
+  const s = SYNC.state();
+  if (D.user && s.migrating) h += `<div class="banner"><span class="grow"><span class="spin" style="display:inline-block;vertical-align:-2px"></span> 이전 버전의 기록을 이 기기로 옮기는 중이에요…</span></div>`;
+  if (D.user && s.denied) h += warn('계정 권한 문제로 다른 기기와의 동기화가 멈췄어요. 기록은 이 기기에 그대로 있어요.', '<button class="btn sm" type="button" data-a="tab" data-tab="settings">설정</button>');
+  if (!D.user && D.mode === 'device' && D.cloud !== 'none' && !hidden('yk:hideLogin')) h += `<div class="banner"><span class="grow">기록은 이 기기에 저장돼요. 구글 계정으로 로그인하면 휴대폰·태블릿·노트북이 같은 기록을 봐요.</span><button class="btn sm pri" type="button" data-a="signIn">로그인</button><button class="ibtn sm" type="button" data-a="hideLogin" aria-label="닫기">${ic('x')}</button></div>`;
+  if (D.user && s.upBlocked) h += warn('구글 전달함(사진·파일 600MB)이 가득 차서 새 사진을 다른 기기로 보내지 못하고 있어요. 전체 백업을 받으면 오래된 사진을 비워서 계속 보낼 수 있어요.', '<button class="btn sm" type="button" data-a="backup">백업</button>');
+  const due = backupDue();
+  if (due !== null) h += `<div class="banner"><span class="grow">${due < 0 ? '아직 전체 백업을 받은 적이 없어요.' : `마지막 백업이 ${due}일 전이에요.`} 한 달에 한 번 백업 파일을 받아 두면 기기를 잃어버려도 기록이 남아요.</span><button class="btn sm" type="button" data-a="backup">백업</button><button class="ibtn sm" type="button" data-a="hideBackup" aria-label="닫기">${ic('x')}</button></div>`;
+  if (!isStandalone() && !LS.get('yk:hideInstall') && D.mode === 'device') h += `<div class="banner"><span class="grow">홈 화면에 설치하면 아이콘을 눌러 바로 열 수 있어요.</span><button class="btn sm pri" type="button" data-a="install">설치</button><button class="ibtn sm" type="button" data-a="hideInstall" aria-label="닫기">${ic('x')}</button></div>`;
   const ex = all.filter((e) => e.ex).length;
   if (ex) h += `<div class="banner"><span class="grow">예시 기록 ${ex}개가 들어 있어요. 책·표·통계가 어떻게 채워지는지 보여 주는 용도예요.</span><button class="btn sm" type="button" data-a="clearExamples">예시 지우기</button></div>`;
   const r = D.settings.reminders.d;
@@ -2075,25 +2895,51 @@ function learnedHtml() {
   return rows.join('');
 }
 
+function storageHtml() {
+  const st = S.store;
+  const files = st && st.files ? `사진·파일 ${st.files.n}개(${fmtBytes(st.files.bytes)})` : '사진·파일 확인 중…';
+  const free = st && st.quota ? ` · 이 앱이 더 쓸 수 있는 공간 약 ${fmtBytes(Math.max(0, st.quota - (st.usage || 0)))}` : '';
+  const prot = D.persisted === true ? '<span class="ok-t">저장 보호 켜짐</span> — 휴대폰 공간이 부족해져도 브라우저가 지우지 않아요.'
+    : D.persisted === false ? '<span class="warn-t">저장 보호 꺼짐</span> — 홈 화면에 설치하면 대부분 켜져요. 그 전까지는 백업을 자주 받아 주세요.'
+      : '이 브라우저는 저장 보호 여부를 알려 주지 않아요.';
+  const me = `<div class="it"><span class="it-ic">${ic('phone')}</span><div class="grow"><b>이 기기 (${esc(DEV.name || '기기')}) — 원본 보관</b><span>기록 ${totalCount()}개 · ${files}${free}</span><span>${prot}</span></div></div>`;
+  let acct;
+  if (D.mode !== 'device') acct = `<div class="it"><span class="it-ic">${ic('cloud')}</span><div class="grow"><b>동기화를 쓸 수 없는 화면</b><span>비공개 창처럼 기기에 저장할 수 없는 화면에서는 동기화도 쓸 수 없어요.</span></div></div>`;
+  else if (D.cloud === 'none') acct = `<div class="it"><span class="it-ic">${ic('cloud')}</span><div class="grow"><b>동기화 연결 없음</b><span>이 기기에만 저장돼요.</span></div></div>`;
+  else if (!D.user) acct = `<div class="it"><span class="it-ic">${ic('cloud')}</span><div class="grow"><b>다른 기기와 맞추기 — 꺼짐</b><span>구글 계정으로 로그인하면 휴대폰·태블릿·노트북이 같은 기록을 봐요. 로그인하지 않아도 이 기기에서는 그대로 쓸 수 있어요.</span></div><button class="btn sm pri" type="button" data-a="signIn">로그인</button></div>`;
+  else {
+    const s = SYNC.state();
+    const [, label, long] = syncState();
+    acct = `<div class="it"><span class="it-ic">${ic('cloud')}</span><div class="grow"><b>${esc(D.user.email)}</b><span>${esc(label)} — ${esc(long)}${s.lastOk || s.lastPull ? ` 마지막으로 맞춘 때: ${ago(Math.max(s.lastOk, s.lastPull))}.` : ''}</span></div><button class="btn sm" type="button" data-a="signOut">로그아웃</button></div>`;
+    const c = S.cloudInfo;
+    if (c) {
+      const pct = Math.min(100, Math.round((c.bytes / c.cap) * 100));
+      acct += `<div class="it col"><div class="grow"><b>구글 전달함 (무료)</b><span>사진·파일 ${fmtBytes(c.bytes)} / ${fmtBytes(c.cap)} 사용${c.ev ? ` · 구글에서 비운 오래된 사진 ${c.ev}개(원본은 기기에 있어요)` : ''}</span></div><div class="meter" role="img" aria-label="${pct}% 사용"><i style="width:${Math.max(1, pct)}%"></i></div>
+        <span class="hint">구글에는 기기 사이에 전달할 사진·파일을 ${fmtBytes(c.cap)}까지만 둬요. 넘치면 다른 기기 두 대 이상이나 전체 백업에 있는 오래된 것부터 구글에서만 지워서, 돈이 나가지 않아요.</span></div>`;
+      if (c.devices.length) acct += `<div class="it col"><div class="grow"><b>이 계정을 쓰는 기기 ${c.devices.length}대</b></div><ul class="devs">${c.devices.map((d) => `<li>${ic(/컴퓨터|맥|크롬북/.test(d.name) ? 'page' : 'phone')}<span class="grow">${esc(d.name)}${d.id === DEV.id ? ' <b class="me">이 기기</b>' : ''}</span><span class="hint">${d.last ? ago(d.last) : ''}</span></li>`).join('')}</ul></div>`;
+    }
+  }
+  return me + acct;
+}
+
 function renderSettings() {
-  const total = totalCount();
-  const u = S.usage;
-  const usage = !CAP.assets ? '' : u ? `첨부 ${u.files}개 · ${(u.bytes / 1048576).toFixed(1)}MB` : '첨부 사용량 확인 중…';
   const lds = ledgers();
   const exN = Array.from(D.entries.values()).filter((e) => e.ex).length;
   const learned = learnedHtml();
-  const account = D.mode === 'cloud'
-    ? `<div class="it"><div class="grow"><b>${esc(S.userEmail || '구글 계정')}</b><span>이 계정으로 로그인한 기기끼리 기록이 자동으로 맞춰져요. 인터넷이 끊겨도 기록되고, 연결되면 저장돼요.</span></div><button class="btn sm" type="button" data-a="signOut">로그아웃</button></div>`
-    : `<div class="it"><div class="grow"><b>이 기기에만 저장 중</b><span>아직 계정 저장소에 연결되지 않았어요.</span></div></div>`;
+  const lastBk = Math.max(Number(LS.get('yk:lastBackup')) || 0, (D.settings.bk && D.settings.bk.at) || 0, D.settings.bkAny || 0);
   const install = isStandalone()
     ? '<div class="it"><div class="grow"><b>앱으로 실행 중</b><span>아이콘을 길게 누르면 ‘바로 쓰기’, ‘현장일지’, ‘가계부’, ‘통계’ 바로가기가 나와요.</span></div></div>'
-    : `<div class="it"><div class="grow"><b>홈 화면에 설치</b><span>설치하면 아이콘을 눌러 바로 열리고, 전체 화면으로 써요.</span></div><button class="btn sm pri" type="button" data-a="install">설치</button></div>`;
+    : `<div class="it"><div class="grow"><b>홈 화면에 설치</b><span>설치하면 아이콘을 눌러 바로 열리고, 기록이 더 안전하게 보관돼요.</span></div><button class="btn sm pri" type="button" data-a="install">설치</button></div>`;
   return `<div class="wrap">
-    <h2 class="h2">계정</h2>
-    <div class="set">${account}
-      <div class="it"><div class="grow"><b>기록 ${total}개 · 책 ${D.books.size}권</b>${usage ? `<span>${usage} (무료 저장 공간 1GB)</span>` : ''}</div></div>
-      ${exN ? `<div class="it"><div class="grow"><b>예시 기록 ${exN}개</b><span>처음 보여 주려고 넣어 둔 기록이에요.</span></div><button class="btn sm" type="button" data-a="clearExamples">지우기</button></div>` : ''}
+    <h2 class="h2">저장과 동기화</h2>
+    <div class="set">${storageHtml()}</div>
+    <p class="hint" style="margin-top:8px">원본은 각 기기 안에 있어요. 구글은 기기 사이에 바뀐 내용을 전달만 해요. 인터넷이 없을 때 쓴 기록은 이 기기에 먼저 저장되고, 다음에 인터넷이 될 때 앱을 열면 전달돼요.</p>
+    <h2 class="h2">백업</h2>
+    <div class="set">
+      <div class="it"><span class="it-ic">${ic('box')}</span><div class="grow"><b>전체 백업 (사진 포함)</b><span>${lastBk ? `마지막 백업: ${ago(lastBk)}` : '아직 받은 적이 없어요'} · 압축 파일 하나에 기록과 사진 원본, 앱 없이 열리는 보기 화면이 들어가요.</span></div><button class="btn sm pri" type="button" data-a="backup">만들기</button></div>
+      <div class="it"><div class="grow"><b>백업으로 복원</b><span>백업 파일(.zip, 이전 버전의 .json)을 고르면 이 기기에 없는 기록과 사진을 넣어요. 지금 기록은 지워지지 않아요.</span></div><button class="btn sm" type="button" data-a="restore">파일 고르기</button></div>
     </div>
+    ${exN ? `<div class="set" style="margin-top:12px"><div class="it"><div class="grow"><b>예시 기록 ${exN}개</b><span>처음 보여 주려고 넣어 둔 기록이에요.</span></div><button class="btn sm" type="button" data-a="clearExamples">지우기</button></div></div>` : ''}
     <h2 class="h2">앱 설치</h2>
     <div class="set">${install}</div>
     <h2 class="h2">자동 정리</h2>
@@ -2110,28 +2956,40 @@ function renderSettings() {
       ${['d', 'w', 'm'].map(remRow).join('')}
     </div>
     <p class="hint" style="margin-top:8px">‘구글 캘린더에 넣기’를 누르면 반복 일정 화면이 열려요. 거기서 저장하면 그 시간에 휴대폰 캘린더 알림이 와요.</p>
-    <h2 class="h2">내보내기 · 백업</h2>
+    <h2 class="h2">내보내기</h2>
     <div class="set">
       <div class="it"><div class="grow"><b>PDF로 저장·공유</b><span>기간과 책을 골라 A4 PDF로 만들어요. 카카오톡 등으로 바로 공유할 수 있어요.</span></div><button class="btn sm" type="button" data-a="exportPdf">만들기</button></div>
       <div class="it"><div class="grow"><b>표 파일(CSV)로 저장</b><span>엑셀이나 구글 시트에서 열 수 있어요.</span></div><button class="btn sm" type="button" data-a="exportCsv">저장</button></div>
-      <div class="it"><div class="grow"><b>전체 백업</b><span>모든 책과 기록을 파일 하나(.json)로 저장해요. 첨부 파일은 계정에 그대로 남아요.</span></div><button class="btn sm" type="button" data-a="backup">저장</button></div>
-      <div class="it"><div class="grow"><b>백업 불러오기</b><span>백업 파일의 책과 기록을 다시 넣어요. 클로드 버전에서 저장한 백업도 돼요.</span></div><button class="btn sm" type="button" data-a="restore">불러오기</button></div>
     </div>
     <h2 class="h2">바로가기 링크</h2>
     <div class="set">
       <div class="it col"><div class="grow"><b>바로 메모 쓰기</b></div><div class="linkbox"><code>${esc(APP_URL)}#write</code><button class="btn sm" type="button" data-a="copyLink" data-h="write">${ic('copy')}복사</button></div></div>
       ${booksArr().map((b) => `<div class="it col"><div class="grow"><b>${esc(b.name)} 바로 열기</b></div><div class="linkbox"><code>${esc(APP_URL)}#b-${esc(b.id)}</code><button class="btn sm" type="button" data-a="copyLink" data-h="b-${esc(b.id)}">${ic('copy')}복사</button></div></div>`).join('')}
     </div>
-    <h2 class="h2">아직 안 되는 것</h2>
+    <h2 class="h2">알아 둘 점</h2>
     <div class="panel"><ul class="lim">
+      <li><b>원본은 각 기기에</b> 있어요. 브라우저의 ‘사이트 데이터 삭제’를 하거나 앱을 지우면 그 기기의 원본이 지워져요. 다른 기기와 백업 파일에는 남아요.</li>
+      <li><b>동기화</b>는 앱이 열려 있을 때 일어나요. 앱을 닫아 둔 기기는 다음에 열 때 맞춰져요.</li>
+      <li><b>새로 연결한 기기</b>에서는 구글에서 이미 비운 오래된 사진이 작은 미리보기로 보여요. 원본은 ‘받아오기 요청’을 누르면, 원본이 있는 기기에서 앱을 열 때 전달돼요.</li>
+      <li><b>비용</b>은 들지 않아요. 구글 무료 한도를 넘으면 돈이 나가는 대신 그날 동기화만 멈추고, 기록은 기기에 계속 저장돼요.</li>
       <li><b>AI 정리</b>는 없어요. 단어 규칙과 기억한 이름으로 정리해요. 틀리면 수정 화면에서 고쳐 저장하면 다음부터 더 잘 맞춰요.</li>
       <li><b>위젯</b>은 만들 수 없어요. 아이콘을 길게 눌러 나오는 바로가기를 홈 화면에 끌어다 두세요.</li>
-      <li><b>첨부</b>는 사진·PDF·텍스트만 돼요. 사진은 자동으로 줄여서 저장하고, PDF는 5MB까지예요. 한글·워드·엑셀은 PDF로 바꿔서 올려 주세요.</li>
+      <li><b>첨부</b>는 사진과 파일(PDF·한글·엑셀 등) 15MB까지예요. 사진은 자동으로 줄여서 보관하고, 동영상은 넣을 수 없어요. 앱 안에서 미리 볼 수 있는 건 사진·PDF·텍스트이고, 나머지는 기기에 저장해서 열어요.</li>
       <li><b>PDF 저장 파일</b>은 화면을 이미지로 담아 만들어서, 그 안에서 글자 검색은 안 돼요.</li>
-      <li><b>무료 저장 공간</b>은 1GB(사진 2천~3천 장)예요. 넘으면 저장이 멈추고 돈은 나가지 않아요. 더 필요해지면 월 수백 원 수준의 유료 전환을 따로 정할 수 있어요.</li>
     </ul></div>
-    <p class="hint" style="margin-top:14px">엮음 ${VERSION}</p>
+    ${D.mode === 'device' ? `<h2 class="h2">이 기기에서 지우기</h2>
+    <div class="set"><div class="it"><div class="grow"><b>이 기기의 기록 모두 지우기</b><span>휴대폰을 바꾸거나 남에게 줄 때 써요. 다른 기기와 백업에는 남아요.</span></div><button class="btn sm dan" type="button" data-a="wipe">지우기</button></div></div>` : ''}
+    <p class="hint" style="margin-top:14px">엮음 ${VERSION}${DEV.id ? ` · 기기 번호 ${esc(DEV.id)}` : ''}</p>
   </div>`;
+}
+
+async function refreshStoreInfo() {
+  const out = {};
+  if (D.mode === 'device') { try { out.files = await STORE.fileStats(); } catch (e) { /* ignore */ } }
+  try { if (navigator.storage && navigator.storage.estimate) { const e = await navigator.storage.estimate(); out.quota = e.quota; out.usage = e.usage; } } catch (e) { /* ignore */ }
+  S.store = out;
+  if (D.user && SYNC.isOn()) { try { S.cloudInfo = await SYNC.info(); } catch (e) { /* offline */ } }
+  scheduleRender();
 }
 // ================= layers & dialogs =================
 const layers = [];
@@ -2296,7 +3154,7 @@ async function editorBeforeClose() {
   if (ok) { discardUploads(); ED = null; }
   return ok;
 }
-function discardUploads() { if (ED) for (const id of ED.uploaded) deleteAsset(id); }
+function discardUploads() { if (ED) for (const id of ED.uploaded) FILES.remove(id); }
 
 function renderEditor(keep) {
   if (!ED) return;
@@ -2336,7 +3194,7 @@ function editorBody() {
     </div>
     <div class="ed-sec"><div class="lbl">첨부</div>
       ${files ? `<div class="thumbs" style="align-items:flex-start">${files}</div>` : ''}
-      ${CAP.assets ? `<div class="row"><button type="button" class="btn sm" data-a="edAttach" ${S.uploading ? 'disabled' : ''}>${S.uploading ? `<span class="spin"></span> 올리는 중 ${S.uploading}개` : `${ic('clip')}사진·파일 추가`}</button><span class="hint">사진·PDF·동영상·텍스트</span></div>` : '<p class="hint">이 화면에서는 첨부를 쓸 수 없어요.</p>'}
+      <div class="row"><button type="button" class="btn sm" data-a="edAttach" ${S.uploading ? 'disabled' : ''}>${S.uploading ? `<span class="spin"></span> 넣는 중 ${S.uploading}개` : `${ic('clip')}사진·파일 추가`}</button><span class="hint">사진, PDF·한글·엑셀 등 파일 15MB까지</span></div>
     </div>
     ${ED.isNew ? '' : `<div class="row" style="margin-top:6px"><button type="button" class="btn sm dan" data-a="edDelete">${ic('trash')}기록 삭제</button><span class="grow"></span><span class="ed-meta">만든 날 ${new Date(d.created).toLocaleString('ko-KR', { dateStyle: 'short', timeStyle: 'short' })}</span></div>`}`;
 }
@@ -2514,7 +3372,7 @@ async function editorAction(a, el) {
       const i = Number(el.dataset.i);
       const f = d.files[i]; if (!f) break;
       d.files.splice(i, 1);
-      if (ED.uploaded.includes(f.id)) { deleteAsset(f.id); ED.uploaded = ED.uploaded.filter((x) => x !== f.id); }
+      if (ED.uploaded.includes(f.id)) { FILES.remove(f.id); ED.uploaded = ED.uploaded.filter((x) => x !== f.id); }
       else ED.removed.push(f.id);
       renderEditor();
       break;
@@ -2563,7 +3421,7 @@ function editorSave() {
   const removed = ED.removed.slice();
   const L = ED.layer;
   const saved = saveEntry(d);
-  for (const id of removed) deleteAsset(id);
+  for (const id of removed) FILES.remove(id);
   const learned = Y.learnFrom(D.settings.learn, saved, booksArr());
   if (learned) { D.settings.learn = learned; saveSettings(); }
   ED = null;
@@ -2764,7 +3622,7 @@ function quickSave() {
   const e = newEntry({ text, date: S.composeDate, files: S.pendFiles.slice() });
   e.org = text ? { st: 'pending' } : { st: 'manual' };
   ta.value = ''; autosize(ta); LS.del('yk:draft');
-  S.pendFiles = [];
+  S.pendFiles = []; savePend();
   const saved = saveEntry(e);
   S.freshIds.add(saved.id);
   S.scrollToEnd = true;
@@ -2844,10 +3702,10 @@ function openSearch() {
 }
 
 // ================= attachments =================
-const ACCEPT = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'text/csv', 'text/markdown', 'application/json']);
-const EXT_TYPE = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', md: 'text/markdown', json: 'application/json' };
-const TYPE_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'application/pdf': 'pdf', 'text/plain': 'txt', 'text/csv': 'csv', 'text/markdown': 'md', 'application/json': 'json' };
-const MAX_DOC = 5 * 1048576;
+const IMG_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const EXT_TYPE = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', heic: 'image/heic', heif: 'image/heif', pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', md: 'text/markdown', json: 'application/json', hwp: 'application/x-hwp', hwpx: 'application/haansofthwpx', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', zip: 'application/zip', dwg: 'application/acad', dxf: 'application/dxf' };
+const TYPE_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/heic': 'heic', 'image/heif': 'heif', 'application/pdf': 'pdf', 'text/plain': 'txt', 'text/csv': 'csv', 'text/markdown': 'md', 'application/json': 'json', 'application/zip': 'zip' };
+const MAX_DOC = 15 * 1048576;
 const uerr = (msg) => Object.assign(new Error(msg), { userMsg: msg });
 
 async function drawImage(file, max, q, asDataUrl) {
@@ -2859,44 +3717,42 @@ async function drawImage(file, max, q, asDataUrl) {
   const g = c.getContext('2d');
   g.fillStyle = '#FFFFFF'; g.fillRect(0, 0, c.width, c.height);
   g.drawImage(bmp, 0, 0, c.width, c.height);
+  if (bmp.close) bmp.close();
   if (asDataUrl) return c.toDataURL('image/jpeg', q);
   return new Promise((r) => c.toBlob(r, 'image/jpeg', q));
 }
 
 async function prepareFile(file) {
   const ext = (file.name.split('.').pop() || '').toLowerCase();
-  if (/^(hwp|hwpx|doc|docx|xls|xlsx|ppt|pptx|zip)$/.test(ext)) throw uerr(`${file.name}: 한글·워드·엑셀 파일은 아직 첨부할 수 없어요. PDF로 저장해서 올려 주세요.`);
-  if (/^(heic|heif)$/.test(ext) || /heic|heif/.test(file.type)) throw uerr(`${file.name}: HEIC 사진은 올릴 수 없어요. 카메라 설정에서 사진 형식을 JPG로 바꾸거나 변환해서 올려 주세요.`);
-  if (/^video\//.test(file.type) || /^(mp4|mov|webm|avi)$/.test(ext)) throw uerr(`${file.name}: 동영상은 무료 저장 공간을 많이 차지해서 넣을 수 없어요.`);
-  const type = ACCEPT.has(file.type) ? file.type : EXT_TYPE[ext];
-  if (!type) throw uerr(`${file.name}: 사진, PDF, 텍스트 파일만 첨부할 수 있어요.`);
-  let name = file.name || `파일.${TYPE_EXT[type]}`;
-  if (/^image\//.test(type)) {
-    // photos are shrunk so the free 1GB lasts: about 1600px, usually 200~500KB
-    let blob, thumb = '';
+  if (/^video\//.test(file.type) || /^(mp4|mov|webm|avi|mkv|3gp|m4v)$/.test(ext)) throw uerr(`${file.name}: 동영상은 너무 커서 넣을 수 없어요.`);
+  const type = file.type || EXT_TYPE[ext] || 'application/octet-stream';
+  let name = file.name || `파일.${TYPE_EXT[type] || 'bin'}`;
+  if (IMG_TYPES.has(type) || (/^image\//.test(type) && !/heic|heif/.test(type))) {
+    // photos are kept at about 1600px (usually 200~500KB): sharp enough to read, light to carry
+    let blob = null, thumb = '';
     try {
       blob = await drawImage(file, 1600, 0.82, false);
-      thumb = await drawImage(file, 240, 0.62, true);
-    } catch (e) { throw uerr(`${file.name}: 이 사진을 읽지 못했어요.`); }
-    if (!blob) throw uerr(`${file.name}: 이 사진을 읽지 못했어요.`);
-    name = name.replace(/\.(png|webp|jpe?g|gif)$/i, '') + '.jpg';
-    return { blob, type: 'image/jpeg', name, thumb };
+      thumb = await drawImage(file, 200, 0.6, true);
+    } catch (e) { blob = null; }
+    if (blob) { name = name.replace(/\.(png|webp|jpe?g|gif|bmp)$/i, '') + '.jpg'; return { blob, type: 'image/jpeg', name, thumb }; }
+    if (file.size > MAX_DOC) throw uerr(`${file.name}: 이 사진을 읽지 못했어요.`);
+    return { blob: file, type, name, thumb: '' };
   }
-  if (file.size > MAX_DOC) throw uerr(`${file.name}: PDF와 문서는 5MB까지 넣을 수 있어요.`);
+  if (file.size > MAX_DOC) throw uerr(`${file.name}: 파일은 15MB까지 넣을 수 있어요.`);
   return { blob: file, type, name, thumb: '' };
 }
 
 async function uploadOne(file) {
   const p = await prepareFile(file);
-  let r;
-  try { r = await CAP.assets.upload(p.blob, { type: p.type, name: p.name }); }
-  catch (e) { console.warn('[엮음] upload', e); throw uerr(`${p.name}: 올리지 못했어요.`); }
-  return { id: r.id, name: p.name, type: r.contentType || p.type, size: r.sizeBytes || p.blob.size, label: '', t: p.thumb };
+  try { return await FILES.add(p); }
+  catch (e) {
+    console.warn('[엮음] keep file', e);
+    throw uerr(e && e.name === 'QuotaExceededError' ? `${p.name}: 이 기기 저장 공간이 부족해요.` : `${p.name}: 저장하지 못했어요.`);
+  }
 }
 
 let pickTarget = 'composer';
 function pickFiles(target) {
-  if (!CAP.assets) { toast('계정에 로그인해야 사진과 파일을 넣을 수 있어요'); return; }
   pickTarget = target;
   const inp = $('#file-pick'); inp.value = ''; inp.click();
 }
@@ -2908,12 +3764,13 @@ async function onFilesPicked(list) {
   for (const file of files) {
     try {
       const f = await uploadOne(file);
-      if (target === 'editor') { if (ED) { ED.draft.files.push(f); ED.uploaded.push(f.id); } else deleteAsset(f.id); }
-      else S.pendFiles.push(f);
+      if (target === 'editor') { if (ED) { ED.draft.files.push(f); ED.uploaded.push(f.id); } else FILES.remove(f.id); }
+      else { S.pendFiles.push(f); savePend(); }
     } catch (e) { toast(e && e.userMsg ? e.userMsg : '파일을 넣지 못했어요', { long: true }); }
     finally { S.uploading--; renderComposer(); if (ED) renderEditor(); }
   }
 }
+function savePend() { if (S.pendFiles.length) LS.set('yk:pendFiles', S.pendFiles); else LS.del('yk:pendFiles'); }
 
 async function saveFile(filename, data) {
   try { await DOWNLOADS.save({ filename, data }); toast('파일을 저장했어요. 내 파일 → 다운로드에서 볼 수 있어요.'); return true; }
@@ -2925,9 +3782,18 @@ function fileName(f) {
   if (!/\.[a-z0-9]{2,5}$/i.test(name)) name += '.' + (TYPE_EXT[f.type] || 'bin');
   return name;
 }
+function fileErrMsg(e) {
+  const c = e && e.code;
+  if (c === 'signed-out') return '원본이 이 기기에 없어요. 로그인하면 다른 기기에서 받아올 수 있어요.';
+  if (c === 'notyet') return '원본이 아직 이 기기로 오지 않았어요. 사진을 넣은 기기에서 인터넷이 될 때 앱을 열면 전달돼요.';
+  if (c === 'evicted') return e.wanted ? '받아오기를 요청해 뒀어요. 원본이 있는 기기에서 앱을 열면 전달돼요.' : '원본이 다른 기기에만 있어요.';
+  if (c === 'deleted') return '이 파일은 지워졌어요.';
+  if (!navigator.onLine || c === 'unavailable') return '원본이 이 기기에 없어요. 인터넷에 연결되면 받아올 수 있어요.';
+  return '원본을 불러오지 못했어요.';
+}
 async function fileBlob(f) {
   try { return await FILES.get(f.id); }
-  catch (e) { toast(navigator.onLine ? '이 파일을 찾지 못했어요.' : '인터넷에 연결되면 이 파일을 열 수 있어요.'); return null; }
+  catch (e) { toast(fileErrMsg(e), { long: true }); return null; }
 }
 async function saveAssetToDevice(f) { const b = await fileBlob(f); if (b) saveFile(fileName(f), b); }
 async function shareAsset(f) { const b = await fileBlob(f); if (b) shareFile(fileName(f), b, f.name); }
@@ -2962,28 +3828,41 @@ function openFileViewer(f) {
   acts.push({ label: '기기에 저장', icon: 'download', run: () => saveAssetToDevice(f) });
   const L = dialog({
     title: f.name + (f.label ? ` · ${f.label}` : ''), cls: 'full',
-    body: `<div class="viewer">${f.t ? `<img id="fv-img" src="${esc(f.t)}" alt="${esc(f.name)}">` : ''}<p class="hint" id="fv-msg">불러오는 중…</p><div id="fv-pages" class="viewer" style="width:100%"></div></div>`,
+    body: `<div class="viewer">${f.t ? `<img id="fv-img" src="${esc(f.t)}" alt="${esc(f.name)}">` : ''}<p class="hint" id="fv-msg">불러오는 중…</p><div id="fv-act"></div><div id="fv-pages" class="viewer" style="width:100%"></div></div>`,
     actions: acts,
+    onClose: () => { if (L && L._url) URL.revokeObjectURL(L._url); },
   });
   FILES.get(f.id).then(async (blob) => {
     if (!document.contains(L.dlg)) return;
     const msg = $('#fv-msg', L.dlg);
-    if (/^image\//.test(blob.type)) {
-      const url = URL.createObjectURL(blob);
+    const type = blob.type || f.type || '';
+    if (/^image\//.test(type) && !/heic|heif/.test(type)) {
+      const url = URL.createObjectURL(blob); L._url = url;
       let img = $('#fv-img', L.dlg);
       if (!img) { img = document.createElement('img'); img.alt = f.name; $('.viewer', L.dlg).prepend(img); }
       img.src = url;
       if (msg) msg.remove();
-    } else if (blob.type === 'application/pdf') {
+    } else if (type === 'application/pdf') {
       renderPdfInto(L, blob);
-    } else {
+    } else if (/^text\/|json/.test(type)) {
       const t = await blob.text();
       if (msg) msg.remove();
       $('#fv-pages', L.dlg).innerHTML = `<pre>${esc(t.slice(0, 300000))}</pre>`;
+    } else if (msg) {
+      msg.textContent = `${fmtBytes(blob.size)} · 이 앱에서는 미리 볼 수 없는 파일이에요. ‘기기에 저장’이나 ‘공유’로 다른 앱에서 열어 주세요.`;
     }
-  }).catch(() => {
+  }).catch((e) => {
     const m = $('#fv-msg', L.dlg);
-    if (m) m.textContent = navigator.onLine ? '파일을 불러오지 못했어요.' : '인터넷에 연결되면 원본을 볼 수 있어요.';
+    if (!m) return;
+    m.textContent = (f.t ? '작은 미리보기만 있어요. ' : '') + fileErrMsg(e);
+    if (e && e.code === 'evicted' && !e.wanted) {
+      $('#fv-act', L.dlg).innerHTML = '<button type="button" class="btn sm pri" id="fv-want">받아오기 요청</button>';
+      $('#fv-want', L.dlg).addEventListener('click', async (ev) => {
+        ev.target.disabled = true;
+        try { await SYNC.requestFile(f.id); m.textContent = '요청했어요. 원본이 있는 기기에서 앱을 인터넷 연결된 상태로 열면 이 기기로 전달돼요.'; ev.target.remove(); }
+        catch (x) { ev.target.disabled = false; toast('요청하지 못했어요. 인터넷 연결을 확인해 주세요.'); }
+      });
+    }
   });
 }
 
@@ -3020,9 +3899,9 @@ async function renderPdfInto(L, blob) {
 }
 
 // ================= export =================
-async function thumbData(id, max) {
-  const blob = await FILES.get(id);
-  return drawImage(blob, max || 900, 0.82, true);
+async function thumbData(f, max) {
+  try { const blob = await FILES.get(f.id); return await drawImage(blob, max || 900, 0.82, true); }
+  catch (e) { if (f.t) return f.t; throw e; }
 }
 
 async function collectExport(st, onProg) {
@@ -3070,7 +3949,7 @@ async function exportBlocks(data, photos, onProg) {
       const imgs = (e.files || []).filter((f) => /^image\//.test(f.type));
       if (imgs.length) {
         const srcs = [];
-        for (const f of imgs.slice(0, 6)) { try { srcs.push(await thumbData(f.id, 700)); } catch (err) { /* skip missing */ } }
+        for (const f of imgs.slice(0, 6)) { try { srcs.push(await thumbData(f, 700)); } catch (err) { /* skip missing */ } }
         if (srcs.length) blocks.push(`<div class="pb"><div class="pimgs">${srcs.map((s) => `<img src="${s}" alt="">`).join('')}</div></div>`);
       }
     }
@@ -3221,53 +4100,6 @@ function openExport(kind, bookId) {
   });
 }
 
-async function doBackup() {
-  toast('전체 기록을 모으는 중…');
-  await loadMonthsWithProgress(Object.keys(D.index.months || {}));
-  const s = clone(D.settings); delete s.reminders;
-  const data = { app: 'yeokkeum', v: 1, exportedAt: new Date().toISOString(), books: booksArr().map((b) => Object.assign({ id: b.id }, Y.bookDoc(b))), settings: s, entries: Array.from(D.entries.values()).sort(sortEntries).map((e) => Object.assign({ id: e.id }, Y.entryDoc(e))) };
-  await saveFile(`엮음_백업_${Y.today()}.json`, JSON.stringify(data));
-}
-
-const VALID_ID = /^[A-Za-z0-9_\-.~:@+]{1,120}$/;
-async function importData(data, label) {
-  const entries = (data.entries || []).filter((e) => e && typeof e === 'object');
-  const ms = Y.uniq(entries.map((e) => Y.monthOf(Y.normEntry('x', e).date)));
-  await loadMonthsWithProgress(ms);
-  let nb = 0, ne = 0;
-  for (const b of data.books || []) {
-    if (!b || !VALID_ID.test(String(b.id || '')) ) continue;
-    if (label === 'migrate' && D.books.has(b.id)) continue;
-    saveBook(Y.normBook(String(b.id), b)); nb++;
-  }
-  for (const e of entries) {
-    const id = VALID_ID.test(String(e.id || '')) ? String(e.id) : Y.rid('e');
-    saveEntry(Y.normEntry(id, e), { quiet: true }); ne++;
-  }
-  scheduleRender();
-  return { nb, ne };
-}
-
-async function onJsonPicked(file) {
-  let data;
-  try { data = JSON.parse(await file.text()); } catch (e) { toast('백업 파일을 읽지 못했어요'); return; }
-  if (!data || data.app !== 'yeokkeum' || !Array.isArray(data.entries)) { toast('엮음 백업 파일이 아니에요'); return; }
-  const ok = await confirmBox({ title: '백업을 불러올까요?', message: `책 ${(data.books || []).length}권, 기록 ${data.entries.length}개가 들어 있어요. 같은 기록은 백업 내용으로 바뀌고, 나머지 기록은 그대로 남아요.`, ok: '불러오기' });
-  if (!ok) return;
-  const r = await importData(data, 'restore');
-  toast(`책 ${r.nb}권, 기록 ${r.ne}개를 불러왔어요`);
-}
-
-async function migrateLocal() {
-  const loc = LS.get('yk:data');
-  if (!loc || !Array.isArray(loc.entries)) return;
-  const ok = await confirmBox({ title: '계정으로 옮길까요?', message: `이 기기에만 있던 기록 ${loc.entries.length}개를 계정에 저장해요. 옮긴 뒤에는 다른 기기에서도 보여요.`, ok: '옮기기' });
-  if (!ok) return;
-  const r = await importData(loc, 'migrate');
-  LS.del('yk:data');
-  toast(`기록 ${r.ne}개를 계정으로 옮겼어요`);
-}
-
 async function clearExamples() {
   const ok = await confirmBox({ title: '예시 기록을 지울까요?', message: '예시로 넣어 둔 기록만 지워지고, 직접 쓴 기록은 그대로예요.', ok: '예시 지우기', danger: true });
   if (!ok) return;
@@ -3314,133 +4146,428 @@ function loadExamples() {
   scheduleRender();
   toast(`예시 기록 ${n}개를 넣었어요. 위쪽 ‘예시 지우기’로 한 번에 지울 수 있어요.`, { long: true });
 }
-// ================= platform: Firebase login + storage, files, saving, install =================
+// ================= full backup (records + photos and files) and restore =================
+// A backup is one .zip anyone can open: 엮음-보기.html shows every record and photo without the app or the
+// internet, data.json is what ‘백업으로 복원’ reads, and files/ holds the originals.
+const PART_LIMIT = 800 * 1048576; // keep each zip small enough for a phone to build
 
-// ---------- gate (login / wrong account / first start offline) ----------
-function showGate(mode, extra) {
-  const g = $('#gate');
-  g.hidden = false;
-  document.body.classList.add('gated');
-  const user = CAP.auth && CAP.auth.currentUser;
-  let body = '';
-  if (mode === 'login') {
-    body = `<button class="btn pri gate-btn" type="button" id="gate-login">구글 계정으로 시작하기</button>
-      <p class="gate-note">기록은 이 구글 계정에만 저장돼요. 휴대폰·태블릿·노트북에서 같은 계정으로 로그인하면 같은 기록이 보여요.</p>
-      <p class="gate-err" id="gate-err" role="alert">${esc(extra || '')}</p>`;
-  } else if (mode === 'denied') {
-    body = `<p class="gate-msg">이 앱은 주인 계정만 쓸 수 있어요.${user && user.email ? `<br><span class="hint">지금 로그인한 계정: ${esc(user.email)}</span>` : ''}</p>
-      <button class="btn gate-btn" type="button" id="gate-switch">다른 계정으로 로그인</button>`;
-  } else if (mode === 'offline') {
-    body = `<p class="gate-msg">이 기기에서 처음 열 때는 인터넷 연결이 한 번 필요해요.<br>연결되면 자동으로 이어서 열려요.</p>
-      <button class="btn gate-btn" type="button" id="gate-retry">다시 시도</button>`;
-  } else {
-    body = '<p class="gate-msg"><span class="spin" style="display:inline-block;vertical-align:-2px"></span> 불러오는 중…</p>';
-  }
-  $('#gate-body').innerHTML = body;
+async function localRecs(k) {
+  const out = [];
+  if (D.mode !== 'device') { for (const r of memRecs.values()) if (r.k === k && !r.del && r.d) out.push(r); return out; }
+  await STORE.eachKind(k, (r) => { if (!r.del && r.d) out.push(r); });
+  return out;
 }
-function hideGate() {
-  $('#gate').hidden = true;
-  document.body.classList.remove('gated');
+
+const safeName = (s) => String(s || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+function fileExt(name, type) {
+  const m = String(name || '').match(/\.([A-Za-z0-9]{1,5})$/);
+  if (m) return m[1].toLowerCase();
+  return TYPE_EXT[type] || 'bin';
+}
+
+function viewerHtml(data) {
+  const json = JSON.stringify(data).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  return BACKUP_VIEWER.replace('<!--DATA-->', `<script id="yk-data" type="application/json">${json}</script>`);
+}
+
+const README = (date, parts) => [
+  `엮음 기록 백업 (${date} 저장)`,
+  '',
+  '· 엮음-보기.html — 압축을 푼 뒤 이 파일을 열면 앱이나 인터넷 없이 모든 기록과 사진을 볼 수 있어요. (컴퓨터에서 열면 가장 잘 보여요)',
+  '· data.json — 엮음 앱의 설정 → ‘백업으로 복원’에서 이 압축 파일을 고르면 기록과 사진을 다시 넣을 수 있어요.',
+  '· files 폴더 — 첨부한 사진과 파일 원본이에요.',
+  parts > 1 ? `· 사진이 많아서 백업이 ${parts}개 파일로 나뉘었어요. 모두 같은 곳에 보관해 주세요.` : '',
+].filter(Boolean).join('\r\n');
+
+/** Builds the backup parts. Returns [{name, blob, files}] */
+async function buildBackup(withFiles, onProg, cancelled) {
+  onProg('기록을 모으는 중…', 0, 1);
+  const [ents, bks, sts] = await Promise.all([localRecs('e'), localRecs('b'), localRecs('s')]);
+  const settings = sts.find((r) => r.id === 'main') || null;
+  ents.sort((a, b) => (a.d.date < b.d.date ? -1 : a.d.date > b.d.date ? 1 : (a.d.ts || 0) - (b.d.ts || 0)));
+  const files = {};
+  const plan = [];
+  for (const r of ents) {
+    for (const f of r.d.files || []) {
+      if (files[f.id]) continue;
+      files[f.id] = { name: f.name, type: f.type, size: f.size || 0, date: r.d.date, label: f.label || '' };
+      if (withFiles) plan.push(f.id);
+    }
+  }
+  // which originals are on this device
+  let missing = 0;
+  const have = [];
+  for (let i = 0; i < plan.length; i++) {
+    if (cancelled()) throw new Error('cancelled');
+    const id = plan[i];
+    const blob = await FILES.local(id);
+    if (blob) { files[id].size = blob.size; have.push({ id, blob }); } else missing++;
+    if (i % 50 === 0) onProg('사진·파일을 확인하는 중…', i, plan.length);
+  }
+  // split into parts by size (files are in date order, so each part covers a stretch of time)
+  const parts = [[]];
+  let cur = 0;
+  for (const it of have) {
+    if (cur + it.blob.size > PART_LIMIT && parts[parts.length - 1].length) { parts.push([]); cur = 0; }
+    parts[parts.length - 1].push(it); cur += it.blob.size;
+  }
+  const used = new Set();
+  parts.forEach((p, pi) => p.forEach((it) => {
+    const x = files[it.id];
+    let path = `files/${x.date} ${safeName(x.label ? `${x.label} ${x.name}` : x.name).replace(/\.[A-Za-z0-9]{1,5}$/, '')}`.trim();
+    if (used.has(path.toLowerCase())) path += ` (${it.id.slice(0, 6)})`;
+    used.add(path.toLowerCase());
+    x.path = `${path}.${fileExt(x.name, x.type)}`;
+    x.part = pi + 1;
+  }));
+  const day = Y.today();
+  const data = {
+    app: 'yeokkeum', v: 3, exportedAt: new Date().toISOString(), device: DEV.name, parts: parts.length,
+    books: bks.map((r) => Object.assign({}, r.d, { id: r.id, _v: r.v, _dv: r.dv })),
+    settings: settings ? Object.assign({}, settings.d, { _v: settings.v, _dv: settings.dv }) : null,
+    entries: ents.map((r) => Object.assign({}, r.d, { id: r.id, _v: r.v, _dv: r.dv })),
+    files,
+  };
+  const out = [];
+  const total = have.reduce((s, it) => s + it.blob.size, 0) || 1;
+  let doneBytes = 0;
+  for (let pi = 0; pi < parts.length; pi++) {
+    const z = ZIP.writer();
+    const d = Object.assign({}, data, { part: pi + 1 });
+    await z.add('읽어 주세요.txt', README(day, parts.length));
+    await z.add('엮음-보기.html', viewerHtml(d));
+    await z.add('data.json', JSON.stringify(d));
+    for (const it of parts[pi]) {
+      if (cancelled()) throw new Error('cancelled');
+      const x = files[it.id];
+      await z.add(x.path, it.blob, new Date(x.date + 'T12:00:00'));
+      doneBytes += it.blob.size;
+      onProg(parts.length > 1 ? `압축 파일 ${pi + 1}/${parts.length} 만드는 중…` : '압축 파일 만드는 중…', doneBytes, total);
+    }
+    const stem = `엮음-백업-${day}${withFiles ? '' : '-글만'}${parts.length > 1 ? `-${pi + 1}of${parts.length}` : ''}`;
+    out.push({ name: `${stem}.zip`, blob: z.finish(), files: parts[pi].length });
+  }
+  return { parts: out, entries: ents.length, files: have.length, missing, withFiles };
+}
+
+function openBackup() {
+  const st = { busy: false, cancel: false, res: null, withFiles: true };
+  const body = () => `
+    <div class="fld"><span class="lbl">무엇을 담을까요?</span>
+      <label class="check"><input type="radio" name="bkw" value="1" ${st.withFiles ? 'checked' : ''}><span><b>기록 + 사진·파일 (추천)</b><br><span class="hint">이 기기에 있는 원본을 모두 담아요. 사진이 많으면 커요.</span></span></label>
+      <label class="check"><input type="radio" name="bkw" value="0" ${st.withFiles ? '' : 'checked'}><span><b>기록만</b><br><span class="hint">글·표·금액만 담은 작은 파일이에요.</span></span></label>
+    </div>
+    <p class="hint">백업 파일은 휴대폰의 ‘다운로드’ 폴더에 저장돼요. 구글 드라이브나 컴퓨터에 한 부 더 옮겨 두면 가장 안전해요.</p>
+    <div class="prog" id="b-prog" hidden><i></i></div><p class="hint" id="b-status" role="status"></p><div class="row wrap-r" id="b-out" hidden></div>`;
+  const L = dialog({ title: '전체 백업', body: body(), actions: [{ spacer: true }, { label: '닫기', run: (l) => closeLayer(l) }, { label: '백업 만들기', kind: 'pri', run: (l) => run(l) }], onClose: () => { st.cancel = true; } });
+  const setProg = (label, d, n) => { const p = $('#b-prog', L.dlg); const s = $('#b-status', L.dlg); if (!p) return; p.hidden = false; p.firstElementChild.style.width = `${Math.round((d / Math.max(1, n)) * 100)}%`; s.textContent = label; };
+  L.dlg.addEventListener('change', (ev) => { if (ev.target.name === 'bkw') st.withFiles = ev.target.value === '1'; });
+  async function run(l) {
+    if (st.busy) return;
+    st.busy = true; st.cancel = false;
+    $$('.dlg-f .btn', l.dlg).forEach((b) => { b.disabled = true; });
+    try {
+      const res = await buildBackup(st.withFiles, setProg, () => st.cancel || !document.contains(l.dlg));
+      st.res = res;
+      const size = res.parts.reduce((s, p) => s + p.blob.size, 0);
+      $('#b-status', l.dlg).textContent = `준비됐어요: 기록 ${res.entries}개${res.withFiles ? `, 사진·파일 ${res.files}개` : ''} · ${fmtBytes(size)}${res.missing ? ` · 원본이 이 기기에 없는 파일 ${res.missing}개는 빠졌어요(다른 기기에서 백업하면 들어가요)` : ''}`;
+      const o = $('#b-out', l.dlg);
+      o.hidden = false;
+      o.innerHTML = res.parts.map((p, i) => `<div class="row wrap-r" style="width:100%"><span class="grow hint">${esc(p.name)} · ${fmtBytes(p.blob.size)}</span>${canShareFiles() && p.blob.size < 200 * 1048576 ? `<button type="button" class="btn sm" data-bo="share" data-i="${i}">공유</button>` : ''}<button type="button" class="btn sm pri" data-bo="save" data-i="${i}">${ic('download')}저장</button></div>`).join('');
+      $('#b-prog', l.dlg).hidden = true;
+    } catch (e) {
+      if (e && e.message === 'cancelled') return;
+      console.warn('[엮음] backup', e);
+      const s = $('#b-status', l.dlg); if (s) s.textContent = e && e.code === 'zip-too-big' ? '파일이 너무 많아서 한 번에 담지 못했어요.' : '백업을 만들지 못했어요. 저장 공간을 확인하고 다시 시도해 주세요.';
+    } finally {
+      st.busy = false;
+      if (document.contains(l.dlg)) $$('.dlg-f .btn', l.dlg).forEach((b) => { b.disabled = false; });
+    }
+  }
+  L.dlg.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('[data-bo]');
+    if (!b || !st.res) return;
+    const p = st.res.parts[Number(b.dataset.i)];
+    if (!p) return;
+    const ok = b.dataset.bo === 'share' ? await shareFile(p.name, p.blob, '엮음 백업') : await saveFile(p.name, p.blob);
+    if (ok) markBackup(st.res);
+  });
+}
+
+function markBackup(res) {
+  const at = Date.now();
+  LS.set('yk:lastBackup', at);
+  if (res.withFiles && !res.missing) { D.settings.bk = { at, dev: DEV.id }; saveSettings(); }
+  else if (res.withFiles) { D.settings.bkAny = at; saveSettings(); }
+  else { D.settings.bkAny = at; saveSettings(); }
+  scheduleRender();
+}
+
+// ---------- restore ----------
+function pickRestore() { const p = $('#json-pick'); p.value = ''; p.click(); }
+
+async function onRestorePicked(fileList) {
+  const list = Array.from(fileList || []);
+  if (!list.length) return;
+  if (D.mode !== 'device') { toast('이 화면에서는 복원할 수 없어요. 앱을 설치하거나 크롬에서 열어 주세요.', { long: true }); return; }
+  const sources = [];
+  for (const f of list) {
+    try {
+      if (/\.zip$/i.test(f.name) || f.type === 'application/zip' || f.type === 'application/x-zip-compressed') {
+        const z = await ZIP.reader(f);
+        const txt = await z.text('data.json');
+        if (!txt) throw new Error('no-data');
+        sources.push({ data: JSON.parse(txt), zip: z });
+      } else sources.push({ data: JSON.parse(await f.text()), zip: null });
+    } catch (e) { console.warn('[엮음] restore read', e); toast(`${f.name}: 엮음 백업 파일이 아니에요.`, { long: true }); return; }
+  }
+  const data = sources[0].data;
+  if (!data || data.app !== 'yeokkeum' || !Array.isArray(data.entries)) { toast('엮음 백업 파일이 아니에요'); return; }
+  const nFiles = sources.reduce((s, x) => s + (x.zip ? Object.values(x.data.files || {}).filter((f) => f.path && x.zip.has(f.path)).length : 0), 0);
+  const ok = await confirmBox({ title: '백업으로 복원할까요?', message: `기록 ${data.entries.length}개${nFiles ? `, 사진·파일 ${nFiles}개` : ''}가 들어 있어요. 지금 있는 기록은 지워지지 않고, 이 기기에 없거나 백업 쪽이 더 최신인 기록만 들어가요.`, ok: '복원' });
+  if (!ok) return;
+  toast('복원하는 중…');
+  let files = 0;
+  for (const s of sources) {
+    if (!s.zip) continue;
+    for (const [id, x] of Object.entries(s.data.files || {})) {
+      if (!x.path || !s.zip.has(x.path) || !/^[A-Za-z0-9_-]{4,64}$/.test(id)) continue;
+      const cur = await STORE.getFile(id);
+      if (cur && cur.blob) continue;
+      const blob = await s.zip.blob(x.path, x.type || '');
+      if (!blob) continue;
+      await STORE.putFile({ id, name: String(x.name || '파일'), type: String(x.type || ''), size: blob.size, created: Date.now(), blob, att: 1, pend: 1 });
+      files++;
+    }
+  }
+  const recs = [];
+  const VALID = /^[A-Za-z0-9_\-.~:@+]{1,120}$/;
+  const ver = (x, t) => ({ v: Number(x._v) || Math.max(2, Number(t) || 2), dv: String(x._dv || 'backup') });
+  for (const b of data.books || []) {
+    if (!b || !VALID.test(String(b.id || ''))) continue;
+    const id = String(b.id);
+    recs.push(Object.assign({ key: recKey('b', id), k: 'b', id, del: 0, d: Y.bookDoc(Y.normBook(id, b)) }, ver(b, b.created)));
+  }
+  if (data.settings && typeof data.settings === 'object') {
+    const s = Y.normSettings(data.settings);
+    recs.push(Object.assign({ key: recKey('s', 'main'), k: 's', id: 'main', del: 0, d: s }, ver(data.settings, 2)));
+  }
+  for (const e0 of data.entries) {
+    if (!e0 || typeof e0 !== 'object') continue;
+    const id = VALID.test(String(e0.id || '')) ? String(e0.id) : Y.rid('e');
+    const e = Y.normEntry(id, e0);
+    recs.push(Object.assign({ key: recKey('e', id), k: 'e', id, del: 0, d: Y.entryDoc(e), m: Y.monthOf(e.date) }, ver(e0, e.updated || e.created)));
+  }
+  for (const r of recs) seenV(r.v);
+  const out = await STORE.merge(recs, { dirty: true });
+  applyChanges(out);
+  for (const c of out) if (c.rec && c.rec.k === 'e') touchMonth(c.rec.m);
+  SYNC.kick();
+  BUS.post({ t: 'file' });
+  const ne = out.filter((c) => c.rec && c.rec.k === 'e').length;
+  toast(`기록 ${ne}개${files ? `, 사진·파일 ${files}개` : ''}를 넣었어요${recs.length - out.length > 0 ? ` (이미 같은 기록 ${recs.length - out.length}개는 그대로 뒀어요)` : ''}.`, { long: true });
+}
+// ================= platform: start-up, Google sign-in for syncing, saving files, install, updates =================
+
+// ---------- this device ----------
+function deviceName() {
+  const ua = navigator.userAgent || '';
+  const touchMac = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
+  if (/iPad/.test(ua) || touchMac) return '아이패드';
+  if (/iPhone|iPod/.test(ua)) return '아이폰';
+  if (/Android/.test(ua)) return /Mobile/.test(ua) ? '안드로이드 휴대폰' : '안드로이드 태블릿';
+  if (/Windows/.test(ua)) return '윈도우 컴퓨터';
+  if (/Macintosh/.test(ua)) return '맥';
+  if (/CrOS/.test(ua)) return '크롬북';
+  if (/Linux/.test(ua)) return '리눅스 컴퓨터';
+  return '기기';
+}
+
+async function loadLocal() {
+  try { await STORE.open(); D.mode = 'device'; }
+  catch (e) { console.warn('[엮음] no device store', e); D.mode = 'memory'; }
+  if (D.mode === 'device') {
+    let dev = await STORE.getMeta('dev');
+    if (!dev || !dev.id) { dev = { id: randHex(5), name: deviceName(), first: Date.now() }; await STORE.setMeta('dev', dev); }
+    Object.assign(DEV, dev);
+    lastV = Math.max(Number(await STORE.getMeta('hlc')) || 0, 0);
+    const [bks, sts] = await Promise.all([STORE.byKind('b'), STORE.byKind('s')]);
+    for (const r of bks) { seenV(r.v); if (!r.del && r.d) D.books.set(r.id, Y.normBook(r.id, r.d)); }
+    const s = sts.find((r) => r.id === 'main');
+    if (s) { seenV(s.v); if (s.d) D.settings = Y.normSettings(s.d); }
+    if (!bks.length && !s) await genesis();
+    const idx = await STORE.getMeta('index');
+    if (idx && idx.v === 3 && idx.months) D.index = idx;
+    else await rebuildIndex();
+  } else {
+    Object.assign(DEV, { id: randHex(5), name: deviceName(), first: Date.now() });
+    for (const b of Y.defaultBooks()) D.books.set(b.id, b);
+  }
+  const m0 = Y.monthOf(Y.today());
+  await Promise.all([ensureMonth(m0), ensureMonth(Y.addMonths(m0, -1))]);
+}
+
+/** First start on a device: the starting books and settings get the oldest possible version,
+    so the person's own books from another device always win when the devices meet. */
+async function genesis() {
+  const recs = [];
+  for (const b of Y.defaultBooks()) {
+    const nb = Object.assign({}, b, { created: 1 });
+    D.books.set(nb.id, nb);
+    recs.push({ key: recKey('b', nb.id), k: 'b', id: nb.id, v: 1, dv: 'start', del: 0, d: Y.bookDoc(nb), dirty: 1 });
+  }
+  D.settings = Y.normSettings(Object.assign(Y.defaultSettings(), { created: 1 }));
+  recs.push({ key: recKey('s', 'main'), k: 's', id: 'main', v: 1, dv: 'start', del: 0, d: clone(D.settings), dirty: 1 });
+  await STORE.merge(recs, { dirty: true });
+}
+
+async function askPersist() {
+  try {
+    if (!navigator.storage || !navigator.storage.persist) { D.persisted = null; return; }
+    D.persisted = await navigator.storage.persisted();
+    if (!D.persisted) D.persisted = await navigator.storage.persist();
+  } catch (e) { D.persisted = null; }
+}
+
+// ---------- the relay (Google Firebase), loaded after the app is already usable ----------
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.async = false;
+    s.onload = () => resolve();
+    s.onerror = () => { s.remove(); reject(new Error('script ' + src)); };
+    document.head.appendChild(s);
+  });
+}
+
+async function oldCacheExists() {
+  try {
+    if (!indexedDB.databases) return true;
+    const list = await indexedDB.databases();
+    return list.some((d) => d && d.name && d.name.startsWith('firestore/'));
+  } catch (e) { return false; }
+}
+async function dropOldCache() {
+  try {
+    if (!indexedDB.databases) return;
+    for (const d of await indexedDB.databases()) if (d && d.name && d.name.startsWith('firestore/')) indexedDB.deleteDatabase(d.name);
+  } catch (e) { /* ignore */ }
+}
+
+async function anyV2Done() {
+  const u = CAP.auth && CAP.auth.currentUser;
+  if (u) return !!(await STORE.getMeta('v2done:' + u.uid));
+  const last = LS.get('yk:lastUid');
+  return last ? !!(await STORE.getMeta('v2done:' + last)) : false;
+}
+
+async function initCloud() {
+  if (!CFG || !CFG.apiKey) { D.cloud = 'none'; updateSync(); return; }
+  try {
+    if (!window.firebase) {
+      await loadScript('vendor/firebase-app-compat.js');
+      await loadScript('vendor/firebase-auth-compat.js');
+      await loadScript('vendor/firebase-firestore-compat.js');
+    }
+    firebase.initializeApp(CFG);
+    // version 2 kept unsent changes in Firestore's own offline store: open it once more so they go out
+    const v2done = D.mode === 'device' ? await anyV2Done() : true;
+    const flush = !v2done && await oldCacheExists();
+    if (v2done) await dropOldCache();
+    const db = firebase.firestore();
+    if (flush) { try { await db.enablePersistence({ synchronizeTabs: true }); } catch (e) { console.warn('[엮음] old cache', e && e.code); } }
+    CAP.db = db;
+    CAP.auth = firebase.auth();
+    D.cloud = 'ready';
+    try { await CAP.auth.getRedirectResult(); } catch (e) { const m = authMsg(e); if (m) toast(m, { long: true }); }
+    CAP.auth.onAuthStateChanged((user) => {
+      if (!user) { D.user = null; SYNC.stop(); scheduleRender(); return; }
+      if (OWNER && String(user.email || '').toLowerCase() !== OWNER) {
+        toast(`${user.email} 계정으로는 동기화할 수 없어요. 주인 계정으로 로그인해 주세요.`, { long: true });
+        CAP.auth.signOut().catch(() => {});
+        return;
+      }
+      D.user = { uid: user.uid, email: user.email || '' };
+      LS.set('yk:lastUid', user.uid);
+      scheduleRender();
+      if (D.mode === 'device') SYNC.start(db, user.uid, { flush }).catch((e) => console.warn('[엮음] sync start', e));
+    });
+  } catch (e) {
+    console.warn('[엮음] relay unavailable', e);
+    D.cloud = navigator.onLine ? 'none' : 'loading';
+    updateSync();
+    if (!navigator.onLine) window.addEventListener('online', () => { if (!CAP.auth) initCloud(); }, { once: true });
+  }
 }
 
 function authMsg(e) {
   const c = (e && e.code) || '';
   if (c === 'auth/popup-closed-by-user' || c === 'auth/cancelled-popup-request') return '';
   if (c === 'auth/network-request-failed') return '인터넷 연결을 확인한 뒤 다시 눌러 주세요.';
-  if (c === 'auth/unauthorized-domain') return '이 주소가 아직 로그인 허용 목록에 없어요. 설정이 끝나면 다시 시도해 주세요.';
+  if (c === 'auth/unauthorized-domain') return '이 주소는 로그인 허용 목록에 없어요.';
   if (c === 'auth/popup-blocked') return '로그인 창이 막혔어요. 다시 한 번 눌러 주세요.';
   if (c === 'auth/operation-not-supported-in-this-environment' || c === 'auth/web-storage-unsupported') return '이 화면에서는 로그인할 수 없어요. 크롬 브라우저에서 이 주소를 열어 로그인해 주세요.';
   return '로그인하지 못했어요. 잠시 후 다시 시도해 주세요.';
 }
 
 async function signIn() {
-  const err = $('#gate-err');
-  if (err) err.textContent = '';
+  if (D.mode !== 'device') { toast('이 화면에서는 기록을 기기에 저장할 수 없어서 동기화도 쓸 수 없어요.', { long: true }); return; }
+  if (!CAP.auth) {
+    if (!navigator.onLine) { toast('인터넷에 연결되면 로그인할 수 있어요.'); return; }
+    toast('연결하는 중…');
+    await initCloud();
+    if (!CAP.auth) { toast('지금은 연결할 수 없어요. 잠시 후 다시 시도해 주세요.'); return; }
+  }
   const provider = new firebase.auth.GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
   try {
     await CAP.auth.signInWithPopup(provider);
+    toast('로그인했어요. 다른 기기와 기록을 맞추는 중이에요.');
   } catch (e) {
     console.warn('[엮음] sign-in', e && e.code);
     if (e && (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment')) {
       try { await CAP.auth.signInWithRedirect(provider); return; } catch (e2) { e = e2; }
     }
     const m = authMsg(e);
-    const el = $('#gate-err');
-    if (el) el.textContent = m;
+    if (m) toast(m, { long: true });
   }
 }
 
 async function signOut() {
-  const ok = await confirmBox({ title: '로그아웃할까요?', message: '이 기기에서만 로그아웃돼요. 기록은 계정에 그대로 남아 있고, 다시 로그인하면 보여요.', ok: '로그아웃' });
+  const st = SYNC.state();
+  const waiting = (st.dirty || 0) + (st.pendFiles || 0);
+  const ok = await confirmBox({
+    title: '로그아웃할까요?',
+    message: `이 기기와 다른 기기 사이의 동기화만 멈춰요. 이 기기의 기록은 그대로 남고, 다시 로그인하면 이어서 맞춰져요.${waiting ? `\n\n아직 다른 기기로 전달하지 못한 변경 ${waiting}개가 있어요. 다시 로그인하면 전달돼요.` : ''}`,
+    ok: '로그아웃',
+  });
   if (!ok) return;
-  try { await CAP.db.terminate(); } catch (e) { /* ignore */ }
-  try { await CAP.db.clearPersistence(); } catch (e) { /* ignore */ }
+  SYNC.stop();
   try { await CAP.auth.signOut(); } catch (e) { /* ignore */ }
+  D.user = null;
+  scheduleRender();
+}
+
+/** Removes every record and file from this device (for a phone that is sold or lost and found). */
+async function wipeDevice() {
+  const st = SYNC.state();
+  const waiting = D.mode === 'device' ? ((await STORE.countDirty()) + (await STORE.pendFiles()).length) : 0;
+  const ok = await confirmBox({
+    title: '이 기기에서 모두 지울까요?',
+    message: `이 기기에 저장된 기록·사진·설정을 모두 지우고 로그아웃해요. 다른 기기와 백업 파일에는 그대로 남아요.${waiting ? `\n\n주의: 아직 다른 기기로 전달하지 못한 변경 ${waiting}개가 있어요. 지우면 이것들은 사라져요.` : ''}${!D.user ? '\n\n주의: 로그인하지 않은 상태라 이 기기의 기록은 다른 곳에 없을 수 있어요. 먼저 전체 백업을 받아 두세요.' : ''}`,
+    ok: '모두 지우기', danger: true,
+  });
+  if (!ok) return;
+  void st;
+  SYNC.stop();
+  try { if (CAP.auth) await CAP.auth.signOut(); } catch (e) { /* ignore */ }
+  await STORE.wipe();
+  LS.del('yk:pendFiles'); LS.del('yk:draft');
   location.reload();
 }
 
-// ---------- files: stored in Firestore as compressed pieces (no paid storage needed) ----------
-const FILES = (() => {
-  const CH = 900000;
-  const blobs = new Map();
-  const loading = new Map();
-  const base = () => `${D.base}/files/f`;
-  const rand = () => Array.from(crypto.getRandomValues(new Uint8Array(16))).map((b) => b.toString(16).padStart(2, '0')).join('');
-  const toB64 = (blob) => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1] || ''); fr.onerror = () => rej(fr.error); fr.readAsDataURL(blob); });
-  const fromB64 = (s) => { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
-
-  async function upload(blob, opt) {
-    const id = rand();
-    const b64 = await toB64(blob);
-    const n = Math.max(1, Math.ceil(b64.length / CH));
-    const batch = CAP.db.batch();
-    for (let i = 0; i < n; i++) batch.set(CAP.db.doc(`${base()}/${id}/c/${String(i).padStart(3, '0')}`), { i, d: b64.slice(i * CH, (i + 1) * CH) });
-    batch.set(CAP.db.doc(`${base()}/${id}`), { type: opt.type, size: blob.size, n, name: String(opt.name || '').slice(0, 120), created: Date.now() });
-    // saved on this device right away; sent to the account as soon as there is a connection
-    trackWrite(`${base()}/${id}`, batch.commit(), (e) => onWriteError(e, `${base()}/${id}`, null, null));
-    blobs.set(id, blob);
-    return { id, sizeBytes: blob.size, contentType: opt.type };
-  }
-
-  async function get(id) {
-    if (blobs.has(id)) return blobs.get(id);
-    if (loading.has(id)) return loading.get(id);
-    const p = (async () => {
-      const meta = await CAP.db.doc(`${base()}/${id}`).get();
-      if (!meta.exists) throw Object.assign(new Error('missing'), { code: 'missing' });
-      const m = meta.data();
-      const qs = await CAP.db.collection(`${base()}/${id}/c`).get();
-      const parts = qs.docs.map((d) => d.data()).sort((a, b) => a.i - b.i);
-      if (parts.length < (m.n || 1)) throw Object.assign(new Error('incomplete'), { code: 'incomplete' });
-      return new Blob([fromB64(parts.map((x) => x.d).join(''))], { type: m.type || 'application/octet-stream' });
-    })();
-    loading.set(id, p);
-    try { const b = await p; blobs.set(id, b); return b; } finally { loading.delete(id); }
-  }
-
-  async function remove(id) {
-    blobs.delete(id);
-    const qs = await CAP.db.collection(`${base()}/${id}/c`).get();
-    const batch = CAP.db.batch();
-    qs.docs.forEach((d) => batch.delete(d.ref));
-    batch.delete(CAP.db.doc(`${base()}/${id}`));
-    trackWrite(`${base()}/${id}`, batch.commit(), (e) => console.warn('[엮음] file delete', e));
-    return { deleted: true };
-  }
-
-  async function list() {
-    const qs = await CAP.db.collection(base()).get();
-    let bytes = 0;
-    qs.docs.forEach((d) => { bytes += Number(d.data().size) || 0; });
-    return { assets: [], usage: { files: qs.size, bytes, maxFiles: 0, maxBytes: 0 } };
-  }
-
-  return { upload, get, delete: remove, list };
-})();
-
 // ---------- saving files to the device, and sharing ----------
-const MIME = { pdf: 'application/pdf', csv: 'text/csv;charset=utf-8', json: 'application/json', html: 'text/html;charset=utf-8', txt: 'text/plain;charset=utf-8', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', md: 'text/markdown;charset=utf-8' };
+const MIME = { pdf: 'application/pdf', csv: 'text/csv;charset=utf-8', json: 'application/json', html: 'text/html;charset=utf-8', txt: 'text/plain;charset=utf-8', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', md: 'text/markdown;charset=utf-8', zip: 'application/zip' };
 function toBlob(filename, data) {
   if (data instanceof Blob) return data;
   const ext = (filename.split('.').pop() || '').toLowerCase();
@@ -3453,7 +4580,7 @@ const DOWNLOADS = {
     const a = document.createElement('a');
     a.href = url; a.download = filename; a.rel = 'noopener';
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
     return { status: 'saved' };
   },
 };
@@ -3485,7 +4612,7 @@ async function shareText(text, title) {
 let installEvt = null;
 const isStandalone = () => { try { return matchMedia('(display-mode: standalone)').matches || navigator.standalone === true; } catch (e) { return false; } };
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installEvt = e; scheduleRender(); });
-window.addEventListener('appinstalled', () => { installEvt = null; LS.set('yk:installed', 1); toast('설치했어요. 이제 홈 화면 아이콘으로 바로 열 수 있어요.', { long: true }); scheduleRender(); });
+window.addEventListener('appinstalled', () => { installEvt = null; LS.set('yk:installed', 1); toast('설치했어요. 이제 홈 화면 아이콘으로 바로 열 수 있어요.', { long: true }); askPersist().then(scheduleRender); scheduleRender(); });
 
 async function promptInstall() {
   if (installEvt) {
@@ -3500,9 +4627,10 @@ async function promptInstall() {
     body: `<ul class="lim">
       <li><b>갤럭시 휴대폰·태블릿 (크롬)</b>: 오른쪽 위 ⋮ 메뉴 → ‘홈 화면에 추가’ 또는 ‘앱 설치’ → ‘설치’.</li>
       <li><b>삼성 인터넷</b>: 아래 ≡ 메뉴 → ‘현재 페이지 추가’ → ‘앱스 화면’ 또는 ‘홈 화면’.</li>
+      <li><b>아이폰·아이패드 (사파리)</b>: 아래 공유 버튼 → ‘홈 화면에 추가’.</li>
       <li><b>노트북 (크롬·엣지)</b>: 주소창 오른쪽의 설치 아이콘(모니터에 화살표) → ‘설치’.</li>
     </ul>
-    <p class="hint">설치한 뒤에는 아이콘을 길게 누르면 ‘바로 쓰기’, ‘현장일지’, ‘가계부’ 바로가기가 나와요. 바로가기를 끌어서 홈 화면에 따로 둘 수도 있어요.</p>`,
+    <p class="hint">설치하면 기록이 브라우저 정리 대상에서 빠져 더 안전하게 보관되고, 아이콘을 길게 누르면 ‘바로 쓰기’, ‘현장일지’, ‘가계부’ 바로가기가 나와요.</p>`,
     actions: [{ spacer: true }, { label: '확인', kind: 'pri', run: (l) => closeLayer(l) }],
   });
 }
@@ -3511,51 +4639,38 @@ async function promptInstall() {
 window.addEventListener('online', () => updateSync());
 window.addEventListener('offline', () => updateSync());
 
-// ---------- service worker (works offline, loads fast) ----------
+// ---------- service worker: opens instantly from this device, updates in the background ----------
 function registerSW() {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
-  navigator.serviceWorker.register('sw.js').catch((e) => console.warn('[엮음] sw', e));
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloading = false;
+  const myBuild = (() => { const sc = document.querySelector('script[src^="app.js?v="]'); return sc ? sc.getAttribute('src').split('v=')[1] : ''; })();
+  navigator.serviceWorker.addEventListener('controllerchange', async () => {
+    if (!hadController || reloading) return;
+    let latest = '';
+    try { latest = (await (await fetch('build.txt', { cache: 'no-store' })).text()).trim(); } catch (e) { return; }
+    if (!latest || latest === myBuild) return; // this page is already the newest version
+    const busy = layers.length || ($('#cmp') && $('#cmp').value.trim()) || document.body.classList.contains('typing');
+    if (!busy && document.visibilityState === 'hidden') { reloading = true; location.reload(); return; }
+    toast('새 버전이 준비됐어요.', { long: true, action: '바로 적용', onAction: () => { reloading = true; location.reload(); } });
+  });
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+  }).catch((e) => console.warn('[엮음] sw', e));
 }
 
 // ---------- boot ----------
 async function bootPlatform() {
   registerSW();
-  if (!CFG || !CFG.apiKey || !window.firebase) { initLocal('no-config'); return; }
-  showGate('loading');
-  try {
-    firebase.initializeApp(CFG);
-    const db = firebase.firestore();
-    try { db.settings({ cacheSizeBytes: 200 * 1048576, merge: true }); } catch (e) { /* ignore */ }
-    try { await db.enablePersistence({ synchronizeTabs: true }); } catch (e) { console.warn('[엮음] offline cache unavailable', e && e.code); }
-    CAP.db = db;
-    CAP.auth = firebase.auth();
-    CAP.assets = FILES;
-    CAP.downloads = DOWNLOADS;
-  } catch (e) {
-    console.error('[엮음] firebase init', e);
-    initLocal('init-fail');
-    return;
-  }
-  try { await CAP.auth.getRedirectResult(); } catch (e) { const m = authMsg(e); if (m) setTimeout(() => { const el = $('#gate-err'); if (el) el.textContent = m; }, 0); }
-  let started = false;
-  CAP.auth.onAuthStateChanged((user) => {
-    if (!user) { if (!started) showGate('login'); else location.reload(); return; }
-    if (OWNER && String(user.email || '').toLowerCase() !== OWNER) { showGate('denied'); return; }
-    if (started) return;
-    started = true;
-    S.userEmail = user.email || '';
-    showGate('loading');
-    initCloud(user.uid).catch((e) => { console.error('[엮음] start', e); showGate('offline'); });
-  });
+  await loadLocal();
+  D.ready = true;
+  render();
+  afterReady();
+  askPersist().then(scheduleRender);
+  const keep = new Set((LS.get('yk:pendFiles') || []).map((f) => f && f.id).filter(Boolean));
+  FILES.sweep(keep).catch(() => {});
+  initCloud();
 }
-
-$('#gate').addEventListener('click', (ev) => {
-  const t = ev.target.closest('button');
-  if (!t) return;
-  if (t.id === 'gate-login') signIn();
-  else if (t.id === 'gate-switch') { CAP.auth.signOut().then(() => location.reload()); }
-  else if (t.id === 'gate-retry') location.reload();
-});
 // ================= navigation =================
 function scrollToSec(key) {
   const v = $('#view');
@@ -3592,7 +4707,7 @@ async function navStep(dir) {
     const o = olderInfo();
     if (!o.next) { toast('더 이전 기록이 없어요'); return; }
     const cur = secs[i];
-    await ensureMonth(o.next, false);
+    await ensureMonth(o.next);
     render();
     const s2 = $$('[data-sec]', v).map((s) => s.dataset.sec);
     const k = s2.indexOf(cur) - 1;
@@ -3613,7 +4728,7 @@ function onLogScroll(fromRender) {
   if (cur && cur.dataset.sec !== S.curSec) { S.curSec = cur.dataset.sec; updateCurLabel(); }
   if (!fromRender && v.scrollTop < 140 && !S.olderBusy) {
     const o = olderInfo();
-    if (o.next && !o.loading) { S.olderBusy = true; ensureMonth(o.next, false).finally(() => { S.olderBusy = false; }); }
+    if (o.next && !o.loading) { S.olderBusy = true; ensureMonth(o.next).finally(() => { S.olderBusy = false; }); }
   }
 }
 
@@ -3621,7 +4736,7 @@ function setTab(tab) {
   if (S.tab === tab && tab === 'shelf' && S.book) { S.book = null; render(); return; }
   S.tab = tab; S.book = null;
   if (tab === 'log') S.scrollToEnd = true;
-  if (tab === 'settings' && CAP.assets && !S.usageAsked) { S.usageAsked = true; CAP.assets.list().then((r) => { S.usage = r && r.usage; scheduleRender(); }).catch(() => {}); }
+  if (tab === 'settings') refreshStoreInfo();
   render();
 }
 
@@ -3642,10 +4757,10 @@ async function act(a, el) {
     case 'navNext': navStep(1); break;
     case 'goToday': S.composeDate = Y.today(); S.curSec = null; S.scrollToEnd = true; render(); break;
     case 'search': openSearch(); break;
-    case 'syncTap': if (D.failed.size) retryFailed(); else setTab('settings'); break;
+    case 'syncTap': setTab('settings'); if (D.user) SYNC.kick(0); break;
     case 'cmpSend': quickSave(); break;
     case 'cmpAttach': pickFiles('composer'); break;
-    case 'cmpUnfile': { const f = S.pendFiles.find((x) => x.id === id); S.pendFiles = S.pendFiles.filter((x) => x.id !== id); if (f) deleteAsset(f.id); renderComposer(); break; }
+    case 'cmpUnfile': { const f = S.pendFiles.find((x) => x.id === id); S.pendFiles = S.pendFiles.filter((x) => x.id !== id); savePend(); if (f) FILES.remove(f.id); renderComposer(); break; }
     case 'cmpToday': S.composeDate = Y.today(); S.scrollToEnd = true; render(); break;
     case 'cmpForm': {
       const nbs = notebooks().filter((b) => !b.catchAll || Y.allFields(b).length);
@@ -3654,7 +4769,7 @@ async function act(a, el) {
     }
     case 'tryText': { const t = $('#cmp'); t.value = el.dataset.text; autosize(t); updateSendState(); t.focus(); break; }
     case 'focusCmp': { const t = $('#cmp'); if (t) t.focus(); break; }
-    case 'loadOlder': { const o = olderInfo(); if (o.next) { ensureMonth(o.next, false); scheduleRender(); } break; }
+    case 'loadOlder': { const o = olderInfo(); if (o.next) { ensureMonth(o.next); scheduleRender(); } break; }
     case 'goDay': { S.mode = 'd'; saveUi(); S.curSec = el.dataset.date; render(); scrollToSec(el.dataset.date); break; }
     case 'newPeriod': openEditor(null, { per: el.dataset.per, date: el.dataset.date }); break;
     case 'orgNow': organizeEntry(id); break;
@@ -3682,10 +4797,13 @@ async function act(a, el) {
     case 'statsRange': S.statsRange = el.dataset.k; saveUi(); render(); break;
     case 'chartDir': S.chartDir = el.dataset.dir === 'in' ? 'in' : 'out'; render(); break;
     case 'clearExamples': clearExamples(); break;
-    case 'migrateLocal': migrateLocal(); break;
     case 'install': promptInstall(); break;
     case 'hideInstall': LS.set('yk:hideInstall', 1); render(); break;
+    case 'signIn': signIn(); break;
     case 'signOut': signOut(); break;
+    case 'hideLogin': hideFor('yk:hideLogin', 7); render(); break;
+    case 'hideBackup': hideFor('yk:hideBackup', 7); render(); break;
+    case 'wipe': wipeDevice(); break;
     case 'loadExamples': loadExamples(); break;
     case 'forget': {
       const L = D.settings.learn || {}; const list = L[el.dataset.b] && L[el.dataset.b][el.dataset.f];
@@ -3694,8 +4812,8 @@ async function act(a, el) {
     }
     case 'exportPdf': openExport('pdf', ''); break;
     case 'exportCsv': openExport('csv', ''); break;
-    case 'backup': doBackup(); break;
-    case 'restore': { const p = $('#json-pick'); p.value = ''; p.click(); break; }
+    case 'backup': openBackup(); break;
+    case 'restore': pickRestore(); break;
     case 'copyLink': copyText(`${APP_URL}#${el.dataset.h}`); break;
     default: break;
   }
@@ -3753,9 +4871,7 @@ function onVisible() {
   if (S.todayAtBoot !== t) {
     if (S.composeDate === S.todayAtBoot) S.composeDate = t;
     S.todayAtBoot = t;
-    const m = Y.monthOf(t);
-    const st = D.months.get(m);
-    if (D.mode === 'cloud' && (!st || !st.live)) { if (st && st.unsub) st.unsub(); D.months.delete(m); ensureMonth(m, true); }
+    ensureMonth(Y.monthOf(t));
     scheduleRender();
   }
 }
@@ -3795,7 +4911,7 @@ function bind() {
   cmp.addEventListener('focus', () => { if (coarse()) document.body.classList.add('typing'); });
   cmp.addEventListener('blur', () => setTimeout(() => document.body.classList.remove('typing'), 120));
   $('#file-pick').addEventListener('change', (ev) => onFilesPicked(ev.target.files));
-  $('#json-pick').addEventListener('change', (ev) => { const f = ev.target.files && ev.target.files[0]; if (f) onJsonPicked(f); });
+  $('#json-pick').addEventListener('change', (ev) => onRestorePicked(ev.target.files));
   window.addEventListener('hashchange', applyHash);
   document.addEventListener('visibilitychange', onVisible);
   let rt = 0;
@@ -3815,13 +4931,18 @@ function start() {
   }
   const dr = LS.get('yk:draft');
   if (typeof dr === 'string' && dr) { const t = $('#cmp'); t.value = dr; autosize(t); }
+  const pf = LS.get('yk:pendFiles');
+  if (Array.isArray(pf)) S.pendFiles = pf.filter((f) => f && typeof f.id === 'string').map((f) => Y.normEntry('x', { files: [f] }).files[0]).filter(Boolean);
   bind();
   render();
-  bootPlatform().catch((e) => { console.error('[엮음] boot failed', e); if (!D.ready) initLocal('boot-error'); });
+  bootPlatform().catch((e) => {
+    console.error('[엮음] boot failed', e);
+    if (!D.ready) { D.mode = 'memory'; for (const b of Y.defaultBooks()) D.books.set(b.id, b); D.ready = true; render(); }
+  });
 }
 
 // test hook for local checks (harmless in production)
-window.__yk = { S, D, Y, render, quickSave, organizeEntry, openEditor, openExport, makePdf, exportBlocks, collectExport };
+window.__yk = { S, D, Y, DEV, STORE, SYNC, FILES, ZIP, render, quickSave, organizeEntry, openEditor, openExport, makePdf, exportBlocks, collectExport, buildBackup, onRestorePicked, saveEntry, removeEntry, ensureMonth, totalCount, syncState };
 
 start();
 })();

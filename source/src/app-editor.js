@@ -161,7 +161,7 @@ async function editorBeforeClose() {
   if (ok) { discardUploads(); ED = null; }
   return ok;
 }
-function discardUploads() { if (ED) for (const id of ED.uploaded) deleteAsset(id); }
+function discardUploads() { if (ED) for (const id of ED.uploaded) FILES.remove(id); }
 
 function renderEditor(keep) {
   if (!ED) return;
@@ -201,7 +201,7 @@ function editorBody() {
     </div>
     <div class="ed-sec"><div class="lbl">첨부</div>
       ${files ? `<div class="thumbs" style="align-items:flex-start">${files}</div>` : ''}
-      ${CAP.assets ? `<div class="row"><button type="button" class="btn sm" data-a="edAttach" ${S.uploading ? 'disabled' : ''}>${S.uploading ? `<span class="spin"></span> 올리는 중 ${S.uploading}개` : `${ic('clip')}사진·파일 추가`}</button><span class="hint">사진·PDF·동영상·텍스트</span></div>` : '<p class="hint">이 화면에서는 첨부를 쓸 수 없어요.</p>'}
+      <div class="row"><button type="button" class="btn sm" data-a="edAttach" ${S.uploading ? 'disabled' : ''}>${S.uploading ? `<span class="spin"></span> 넣는 중 ${S.uploading}개` : `${ic('clip')}사진·파일 추가`}</button><span class="hint">사진, PDF·한글·엑셀 등 파일 15MB까지</span></div>
     </div>
     ${ED.isNew ? '' : `<div class="row" style="margin-top:6px"><button type="button" class="btn sm dan" data-a="edDelete">${ic('trash')}기록 삭제</button><span class="grow"></span><span class="ed-meta">만든 날 ${new Date(d.created).toLocaleString('ko-KR', { dateStyle: 'short', timeStyle: 'short' })}</span></div>`}`;
 }
@@ -379,7 +379,7 @@ async function editorAction(a, el) {
       const i = Number(el.dataset.i);
       const f = d.files[i]; if (!f) break;
       d.files.splice(i, 1);
-      if (ED.uploaded.includes(f.id)) { deleteAsset(f.id); ED.uploaded = ED.uploaded.filter((x) => x !== f.id); }
+      if (ED.uploaded.includes(f.id)) { FILES.remove(f.id); ED.uploaded = ED.uploaded.filter((x) => x !== f.id); }
       else ED.removed.push(f.id);
       renderEditor();
       break;
@@ -428,7 +428,7 @@ function editorSave() {
   const removed = ED.removed.slice();
   const L = ED.layer;
   const saved = saveEntry(d);
-  for (const id of removed) deleteAsset(id);
+  for (const id of removed) FILES.remove(id);
   const learned = Y.learnFrom(D.settings.learn, saved, booksArr());
   if (learned) { D.settings.learn = learned; saveSettings(); }
   ED = null;

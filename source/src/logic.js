@@ -288,6 +288,8 @@ const YK = (function () {
       fileLabels: arr(s.fileLabels).length ? uniq(arr(s.fileLabels).map(str).filter(Boolean)).slice(0, 20) : d.fileLabels,
       learn: normLearn(s.learn),
       inApp: s.inApp === undefined ? true : !!s.inApp,
+      bk: s.bk && num(s.bk.at) > 0 ? { at: num(s.bk.at), dev: str(s.bk.dev).slice(0, 40) } : null,
+      bkAny: num(s.bkAny) || 0,
       created: num(s.created) || d.created,
     };
   }

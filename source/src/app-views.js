@@ -18,21 +18,29 @@ function setHtml(el, html) { if (el && el._h !== html) { el.innerHTML = html; el
 
 function syncHtml() { return '<button class="sync" type="button" data-a="syncTap" data-sync data-s="boot"><i></i><span></span></button>'; }
 function syncState() {
-  if (!D.ready) return ['boot', '불러오는 중'];
-  if (D.failed.size) return ['err', '저장 실패 · 다시 시도'];
-  if (D.mode === 'local') return ['local', '이 기기에만 저장'];
-  if (D.mode === 'memory') return ['local', '저장 안 됨'];
-  if (!navigator.onLine) return ['busy', D.pending > 0 ? '오프라인 · 연결되면 저장' : '오프라인'];
-  if (D.pending > 0 || Q.size > 0) return ['busy', '저장 중'];
-  return ['ok', '저장됨'];
+  if (!D.ready) return ['boot', '불러오는 중', ''];
+  if (D.mode === 'memory') return ['err', '저장 안 됨', '이 화면에서는 기록을 기기에 저장할 수 없어요.'];
+  if (D.saveErr) return ['err', '저장 실패', '이 기기에 저장하지 못했어요. 저장 공간을 확인해 주세요.'];
+  if (D.pendingLocal > 0) return ['busy', '저장 중', '이 기기에 저장하는 중이에요.'];
+  if (!D.user) return ['local', '이 기기에 저장됨', '기록은 이 기기에 저장됐어요. 로그인하면 다른 기기와 맞춰져요.'];
+  const s = SYNC.state();
+  if (s.denied) return ['err', '동기화 멈춤', '계정 권한 문제로 동기화가 멈췄어요.'];
+  if (s.migrating) return ['busy', '옮기는 중', '이전 버전의 기록을 이 기기로 옮기는 중이에요.'];
+  const waiting = (s.dirty || 0) + (s.pendFiles || 0);
+  if (!navigator.onLine || s.offline) return ['busy', '오프라인', waiting ? `이 기기에 저장됐어요. 인터넷이 연결되면 다른 기기로 전달돼요 (대기 ${waiting}개).` : '이 기기에 저장됐어요. 인터넷이 연결되면 다른 기기와 맞춰져요.'];
+  if (Date.now() < s.quota) return ['busy', '한도 초과', '오늘 무료 사용량을 다 써서, 한도가 다시 채워지면 이어서 전달해요. 기록은 이 기기에 저장돼 있어요.'];
+  if (s.err) return ['err', '동기화 오류', '잠시 후 다시 시도해요. 기록은 이 기기에 저장돼 있어요.'];
+  if (s.busy || s.up || waiting) return ['busy', '전달 중', '다른 기기로 전달하는 중이에요.'];
+  if (s.down) return ['busy', '받는 중', '다른 기기의 사진·파일을 받는 중이에요.'];
+  return ['ok', '동기화됨', '이 기기에 저장됐고 다른 기기와도 맞춰졌어요.'];
 }
 function updateSync() {
-  const [s, label] = syncState();
+  const [s, label, long] = syncState();
   for (const el of $$('[data-sync]')) {
     if (el.dataset.s !== s) el.dataset.s = s;
     const sp = el.querySelector('span');
     if (sp && sp.textContent !== label) sp.textContent = label;
-    el.title = label;
+    if (el.title !== (long || label)) el.title = long || label;
   }
 }
 
@@ -115,7 +123,6 @@ function renderComposer() {
   const ph = S.pendFiles.map((f) => `<span><b>${esc(f.name)}</b><button class="ibtn sm" type="button" data-a="cmpUnfile" data-id="${esc(f.id)}" aria-label="${esc(f.name)} 빼기">${ic('x')}</button></span>`).join('') + (S.uploading ? `<span><span class="spin"></span><b>올리는 중 ${S.uploading}개</b></span>` : '');
   pend.hidden = !ph;
   setHtml(pend, ph);
-  $('#cmp-attach').hidden = !CAP.assets;
   updateSendState();
 }
 function updateSendState() {
@@ -177,11 +184,29 @@ function renderLog() {
   return html + '</div>';
 }
 
+const hidden = (k) => { const t = LS.get(k); return !!(t && Date.now() < t); };
+const hideFor = (k, days) => LS.set(k, Date.now() + days * 864e5);
+
+function backupDue() {
+  if (D.mode !== 'device' || totalCount() < 15 || hidden('yk:hideBackup')) return null;
+  const last = Math.max(Number(LS.get('yk:lastBackup')) || 0, (D.settings.bk && D.settings.bk.at) || 0, D.settings.bkAny || 0);
+  if (last && Date.now() - last < 30 * 864e5) return null;
+  return last ? Math.floor((Date.now() - last) / 864e5) : -1;
+}
+
 function logBanners(all) {
   let h = '';
-  if (D.mode === 'local') h += `<div class="banner warn"><span class="grow">아직 계정 저장소에 연결되지 않아 기록이 <b>이 기기에만</b> 저장돼요.</span></div>`;
-  if (D.mode === 'memory') h += `<div class="banner warn"><span class="grow">저장소를 쓸 수 없는 화면이에요. 새로고침하면 쓴 기록이 사라져요.</span></div>`;
-  if (!isStandalone() && !LS.get('yk:hideInstall') && D.mode === 'cloud') h += `<div class="banner"><span class="grow">홈 화면에 설치하면 아이콘을 눌러 바로 열 수 있어요.</span><button class="btn sm pri" type="button" data-a="install">설치</button><button class="ibtn sm" type="button" data-a="hideInstall" aria-label="닫기">${ic('x')}</button></div>`;
+  const warn = (msg, btn) => `<div class="banner warn"><span class="grow">${msg}</span>${btn || ''}</div>`;
+  if (D.mode === 'memory') h += warn('이 화면에서는 기록을 기기에 저장할 수 없어요(비공개 창 등). 창을 닫으면 사라져요. 일반 크롬 창에서 열거나 홈 화면에 설치해 주세요.');
+  if (D.saveErr) h += warn('최근 기록을 이 기기에 저장하지 못했어요. 휴대폰 저장 공간을 확인한 뒤 앱을 다시 열어 주세요.');
+  const s = SYNC.state();
+  if (D.user && s.migrating) h += `<div class="banner"><span class="grow"><span class="spin" style="display:inline-block;vertical-align:-2px"></span> 이전 버전의 기록을 이 기기로 옮기는 중이에요…</span></div>`;
+  if (D.user && s.denied) h += warn('계정 권한 문제로 다른 기기와의 동기화가 멈췄어요. 기록은 이 기기에 그대로 있어요.', '<button class="btn sm" type="button" data-a="tab" data-tab="settings">설정</button>');
+  if (!D.user && D.mode === 'device' && D.cloud !== 'none' && !hidden('yk:hideLogin')) h += `<div class="banner"><span class="grow">기록은 이 기기에 저장돼요. 구글 계정으로 로그인하면 휴대폰·태블릿·노트북이 같은 기록을 봐요.</span><button class="btn sm pri" type="button" data-a="signIn">로그인</button><button class="ibtn sm" type="button" data-a="hideLogin" aria-label="닫기">${ic('x')}</button></div>`;
+  if (D.user && s.upBlocked) h += warn('구글 전달함(사진·파일 600MB)이 가득 차서 새 사진을 다른 기기로 보내지 못하고 있어요. 전체 백업을 받으면 오래된 사진을 비워서 계속 보낼 수 있어요.', '<button class="btn sm" type="button" data-a="backup">백업</button>');
+  const due = backupDue();
+  if (due !== null) h += `<div class="banner"><span class="grow">${due < 0 ? '아직 전체 백업을 받은 적이 없어요.' : `마지막 백업이 ${due}일 전이에요.`} 한 달에 한 번 백업 파일을 받아 두면 기기를 잃어버려도 기록이 남아요.</span><button class="btn sm" type="button" data-a="backup">백업</button><button class="ibtn sm" type="button" data-a="hideBackup" aria-label="닫기">${ic('x')}</button></div>`;
+  if (!isStandalone() && !LS.get('yk:hideInstall') && D.mode === 'device') h += `<div class="banner"><span class="grow">홈 화면에 설치하면 아이콘을 눌러 바로 열 수 있어요.</span><button class="btn sm pri" type="button" data-a="install">설치</button><button class="ibtn sm" type="button" data-a="hideInstall" aria-label="닫기">${ic('x')}</button></div>`;
   const ex = all.filter((e) => e.ex).length;
   if (ex) h += `<div class="banner"><span class="grow">예시 기록 ${ex}개가 들어 있어요. 책·표·통계가 어떻게 채워지는지 보여 주는 용도예요.</span><button class="btn sm" type="button" data-a="clearExamples">예시 지우기</button></div>`;
   const r = D.settings.reminders.d;
@@ -675,25 +700,51 @@ function learnedHtml() {
   return rows.join('');
 }
 
+function storageHtml() {
+  const st = S.store;
+  const files = st && st.files ? `사진·파일 ${st.files.n}개(${fmtBytes(st.files.bytes)})` : '사진·파일 확인 중…';
+  const free = st && st.quota ? ` · 이 앱이 더 쓸 수 있는 공간 약 ${fmtBytes(Math.max(0, st.quota - (st.usage || 0)))}` : '';
+  const prot = D.persisted === true ? '<span class="ok-t">저장 보호 켜짐</span> — 휴대폰 공간이 부족해져도 브라우저가 지우지 않아요.'
+    : D.persisted === false ? '<span class="warn-t">저장 보호 꺼짐</span> — 홈 화면에 설치하면 대부분 켜져요. 그 전까지는 백업을 자주 받아 주세요.'
+      : '이 브라우저는 저장 보호 여부를 알려 주지 않아요.';
+  const me = `<div class="it"><span class="it-ic">${ic('phone')}</span><div class="grow"><b>이 기기 (${esc(DEV.name || '기기')}) — 원본 보관</b><span>기록 ${totalCount()}개 · ${files}${free}</span><span>${prot}</span></div></div>`;
+  let acct;
+  if (D.mode !== 'device') acct = `<div class="it"><span class="it-ic">${ic('cloud')}</span><div class="grow"><b>동기화를 쓸 수 없는 화면</b><span>비공개 창처럼 기기에 저장할 수 없는 화면에서는 동기화도 쓸 수 없어요.</span></div></div>`;
+  else if (D.cloud === 'none') acct = `<div class="it"><span class="it-ic">${ic('cloud')}</span><div class="grow"><b>동기화 연결 없음</b><span>이 기기에만 저장돼요.</span></div></div>`;
+  else if (!D.user) acct = `<div class="it"><span class="it-ic">${ic('cloud')}</span><div class="grow"><b>다른 기기와 맞추기 — 꺼짐</b><span>구글 계정으로 로그인하면 휴대폰·태블릿·노트북이 같은 기록을 봐요. 로그인하지 않아도 이 기기에서는 그대로 쓸 수 있어요.</span></div><button class="btn sm pri" type="button" data-a="signIn">로그인</button></div>`;
+  else {
+    const s = SYNC.state();
+    const [, label, long] = syncState();
+    acct = `<div class="it"><span class="it-ic">${ic('cloud')}</span><div class="grow"><b>${esc(D.user.email)}</b><span>${esc(label)} — ${esc(long)}${s.lastOk || s.lastPull ? ` 마지막으로 맞춘 때: ${ago(Math.max(s.lastOk, s.lastPull))}.` : ''}</span></div><button class="btn sm" type="button" data-a="signOut">로그아웃</button></div>`;
+    const c = S.cloudInfo;
+    if (c) {
+      const pct = Math.min(100, Math.round((c.bytes / c.cap) * 100));
+      acct += `<div class="it col"><div class="grow"><b>구글 전달함 (무료)</b><span>사진·파일 ${fmtBytes(c.bytes)} / ${fmtBytes(c.cap)} 사용${c.ev ? ` · 구글에서 비운 오래된 사진 ${c.ev}개(원본은 기기에 있어요)` : ''}</span></div><div class="meter" role="img" aria-label="${pct}% 사용"><i style="width:${Math.max(1, pct)}%"></i></div>
+        <span class="hint">구글에는 기기 사이에 전달할 사진·파일을 ${fmtBytes(c.cap)}까지만 둬요. 넘치면 다른 기기 두 대 이상이나 전체 백업에 있는 오래된 것부터 구글에서만 지워서, 돈이 나가지 않아요.</span></div>`;
+      if (c.devices.length) acct += `<div class="it col"><div class="grow"><b>이 계정을 쓰는 기기 ${c.devices.length}대</b></div><ul class="devs">${c.devices.map((d) => `<li>${ic(/컴퓨터|맥|크롬북/.test(d.name) ? 'page' : 'phone')}<span class="grow">${esc(d.name)}${d.id === DEV.id ? ' <b class="me">이 기기</b>' : ''}</span><span class="hint">${d.last ? ago(d.last) : ''}</span></li>`).join('')}</ul></div>`;
+    }
+  }
+  return me + acct;
+}
+
 function renderSettings() {
-  const total = totalCount();
-  const u = S.usage;
-  const usage = !CAP.assets ? '' : u ? `첨부 ${u.files}개 · ${(u.bytes / 1048576).toFixed(1)}MB` : '첨부 사용량 확인 중…';
   const lds = ledgers();
   const exN = Array.from(D.entries.values()).filter((e) => e.ex).length;
   const learned = learnedHtml();
-  const account = D.mode === 'cloud'
-    ? `<div class="it"><div class="grow"><b>${esc(S.userEmail || '구글 계정')}</b><span>이 계정으로 로그인한 기기끼리 기록이 자동으로 맞춰져요. 인터넷이 끊겨도 기록되고, 연결되면 저장돼요.</span></div><button class="btn sm" type="button" data-a="signOut">로그아웃</button></div>`
-    : `<div class="it"><div class="grow"><b>이 기기에만 저장 중</b><span>아직 계정 저장소에 연결되지 않았어요.</span></div></div>`;
+  const lastBk = Math.max(Number(LS.get('yk:lastBackup')) || 0, (D.settings.bk && D.settings.bk.at) || 0, D.settings.bkAny || 0);
   const install = isStandalone()
     ? '<div class="it"><div class="grow"><b>앱으로 실행 중</b><span>아이콘을 길게 누르면 ‘바로 쓰기’, ‘현장일지’, ‘가계부’, ‘통계’ 바로가기가 나와요.</span></div></div>'
-    : `<div class="it"><div class="grow"><b>홈 화면에 설치</b><span>설치하면 아이콘을 눌러 바로 열리고, 전체 화면으로 써요.</span></div><button class="btn sm pri" type="button" data-a="install">설치</button></div>`;
+    : `<div class="it"><div class="grow"><b>홈 화면에 설치</b><span>설치하면 아이콘을 눌러 바로 열리고, 기록이 더 안전하게 보관돼요.</span></div><button class="btn sm pri" type="button" data-a="install">설치</button></div>`;
   return `<div class="wrap">
-    <h2 class="h2">계정</h2>
-    <div class="set">${account}
-      <div class="it"><div class="grow"><b>기록 ${total}개 · 책 ${D.books.size}권</b>${usage ? `<span>${usage} (무료 저장 공간 1GB)</span>` : ''}</div></div>
-      ${exN ? `<div class="it"><div class="grow"><b>예시 기록 ${exN}개</b><span>처음 보여 주려고 넣어 둔 기록이에요.</span></div><button class="btn sm" type="button" data-a="clearExamples">지우기</button></div>` : ''}
+    <h2 class="h2">저장과 동기화</h2>
+    <div class="set">${storageHtml()}</div>
+    <p class="hint" style="margin-top:8px">원본은 각 기기 안에 있어요. 구글은 기기 사이에 바뀐 내용을 전달만 해요. 인터넷이 없을 때 쓴 기록은 이 기기에 먼저 저장되고, 다음에 인터넷이 될 때 앱을 열면 전달돼요.</p>
+    <h2 class="h2">백업</h2>
+    <div class="set">
+      <div class="it"><span class="it-ic">${ic('box')}</span><div class="grow"><b>전체 백업 (사진 포함)</b><span>${lastBk ? `마지막 백업: ${ago(lastBk)}` : '아직 받은 적이 없어요'} · 압축 파일 하나에 기록과 사진 원본, 앱 없이 열리는 보기 화면이 들어가요.</span></div><button class="btn sm pri" type="button" data-a="backup">만들기</button></div>
+      <div class="it"><div class="grow"><b>백업으로 복원</b><span>백업 파일(.zip, 이전 버전의 .json)을 고르면 이 기기에 없는 기록과 사진을 넣어요. 지금 기록은 지워지지 않아요.</span></div><button class="btn sm" type="button" data-a="restore">파일 고르기</button></div>
     </div>
+    ${exN ? `<div class="set" style="margin-top:12px"><div class="it"><div class="grow"><b>예시 기록 ${exN}개</b><span>처음 보여 주려고 넣어 둔 기록이에요.</span></div><button class="btn sm" type="button" data-a="clearExamples">지우기</button></div></div>` : ''}
     <h2 class="h2">앱 설치</h2>
     <div class="set">${install}</div>
     <h2 class="h2">자동 정리</h2>
@@ -710,26 +761,38 @@ function renderSettings() {
       ${['d', 'w', 'm'].map(remRow).join('')}
     </div>
     <p class="hint" style="margin-top:8px">‘구글 캘린더에 넣기’를 누르면 반복 일정 화면이 열려요. 거기서 저장하면 그 시간에 휴대폰 캘린더 알림이 와요.</p>
-    <h2 class="h2">내보내기 · 백업</h2>
+    <h2 class="h2">내보내기</h2>
     <div class="set">
       <div class="it"><div class="grow"><b>PDF로 저장·공유</b><span>기간과 책을 골라 A4 PDF로 만들어요. 카카오톡 등으로 바로 공유할 수 있어요.</span></div><button class="btn sm" type="button" data-a="exportPdf">만들기</button></div>
       <div class="it"><div class="grow"><b>표 파일(CSV)로 저장</b><span>엑셀이나 구글 시트에서 열 수 있어요.</span></div><button class="btn sm" type="button" data-a="exportCsv">저장</button></div>
-      <div class="it"><div class="grow"><b>전체 백업</b><span>모든 책과 기록을 파일 하나(.json)로 저장해요. 첨부 파일은 계정에 그대로 남아요.</span></div><button class="btn sm" type="button" data-a="backup">저장</button></div>
-      <div class="it"><div class="grow"><b>백업 불러오기</b><span>백업 파일의 책과 기록을 다시 넣어요. 클로드 버전에서 저장한 백업도 돼요.</span></div><button class="btn sm" type="button" data-a="restore">불러오기</button></div>
     </div>
     <h2 class="h2">바로가기 링크</h2>
     <div class="set">
       <div class="it col"><div class="grow"><b>바로 메모 쓰기</b></div><div class="linkbox"><code>${esc(APP_URL)}#write</code><button class="btn sm" type="button" data-a="copyLink" data-h="write">${ic('copy')}복사</button></div></div>
       ${booksArr().map((b) => `<div class="it col"><div class="grow"><b>${esc(b.name)} 바로 열기</b></div><div class="linkbox"><code>${esc(APP_URL)}#b-${esc(b.id)}</code><button class="btn sm" type="button" data-a="copyLink" data-h="b-${esc(b.id)}">${ic('copy')}복사</button></div></div>`).join('')}
     </div>
-    <h2 class="h2">아직 안 되는 것</h2>
+    <h2 class="h2">알아 둘 점</h2>
     <div class="panel"><ul class="lim">
+      <li><b>원본은 각 기기에</b> 있어요. 브라우저의 ‘사이트 데이터 삭제’를 하거나 앱을 지우면 그 기기의 원본이 지워져요. 다른 기기와 백업 파일에는 남아요.</li>
+      <li><b>동기화</b>는 앱이 열려 있을 때 일어나요. 앱을 닫아 둔 기기는 다음에 열 때 맞춰져요.</li>
+      <li><b>새로 연결한 기기</b>에서는 구글에서 이미 비운 오래된 사진이 작은 미리보기로 보여요. 원본은 ‘받아오기 요청’을 누르면, 원본이 있는 기기에서 앱을 열 때 전달돼요.</li>
+      <li><b>비용</b>은 들지 않아요. 구글 무료 한도를 넘으면 돈이 나가는 대신 그날 동기화만 멈추고, 기록은 기기에 계속 저장돼요.</li>
       <li><b>AI 정리</b>는 없어요. 단어 규칙과 기억한 이름으로 정리해요. 틀리면 수정 화면에서 고쳐 저장하면 다음부터 더 잘 맞춰요.</li>
       <li><b>위젯</b>은 만들 수 없어요. 아이콘을 길게 눌러 나오는 바로가기를 홈 화면에 끌어다 두세요.</li>
-      <li><b>첨부</b>는 사진·PDF·텍스트만 돼요. 사진은 자동으로 줄여서 저장하고, PDF는 5MB까지예요. 한글·워드·엑셀은 PDF로 바꿔서 올려 주세요.</li>
+      <li><b>첨부</b>는 사진과 파일(PDF·한글·엑셀 등) 15MB까지예요. 사진은 자동으로 줄여서 보관하고, 동영상은 넣을 수 없어요. 앱 안에서 미리 볼 수 있는 건 사진·PDF·텍스트이고, 나머지는 기기에 저장해서 열어요.</li>
       <li><b>PDF 저장 파일</b>은 화면을 이미지로 담아 만들어서, 그 안에서 글자 검색은 안 돼요.</li>
-      <li><b>무료 저장 공간</b>은 1GB(사진 2천~3천 장)예요. 넘으면 저장이 멈추고 돈은 나가지 않아요. 더 필요해지면 월 수백 원 수준의 유료 전환을 따로 정할 수 있어요.</li>
     </ul></div>
-    <p class="hint" style="margin-top:14px">엮음 ${VERSION}</p>
+    ${D.mode === 'device' ? `<h2 class="h2">이 기기에서 지우기</h2>
+    <div class="set"><div class="it"><div class="grow"><b>이 기기의 기록 모두 지우기</b><span>휴대폰을 바꾸거나 남에게 줄 때 써요. 다른 기기와 백업에는 남아요.</span></div><button class="btn sm dan" type="button" data-a="wipe">지우기</button></div></div>` : ''}
+    <p class="hint" style="margin-top:14px">엮음 ${VERSION}${DEV.id ? ` · 기기 번호 ${esc(DEV.id)}` : ''}</p>
   </div>`;
+}
+
+async function refreshStoreInfo() {
+  const out = {};
+  if (D.mode === 'device') { try { out.files = await STORE.fileStats(); } catch (e) { /* ignore */ } }
+  try { if (navigator.storage && navigator.storage.estimate) { const e = await navigator.storage.estimate(); out.quota = e.quota; out.usage = e.usage; } } catch (e) { /* ignore */ }
+  S.store = out;
+  if (D.user && SYNC.isOn()) { try { S.cloudInfo = await SYNC.info(); } catch (e) { /* offline */ } }
+  scheduleRender();
 }

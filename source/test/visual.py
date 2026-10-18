@@ -1,0 +1,26 @@
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from playwright.sync_api import sync_playwright
+from harness import Device, ERRORS
+with sync_playwright() as p:
+    b = p.chromium.launch()
+    A = Device(b, 'V').open()
+    A.page.click('[data-a="loadExamples"]')
+    A.page.wait_for_timeout(800)
+    A.page.fill('#cmp', '오늘 D현장 주방 콘센트 2구 증설, 작업자 2명')
+    A.page.wait_for_timeout(200)
+    A.shot('30-composer-typing')
+    A.page.click('#cmp-send')
+    A.page.wait_for_timeout(2700)
+    A.shot('31-log')
+    first = A.page.query_selector('.sheet')
+    A.page.click('.sheet >> nth=-1')
+    A.page.wait_for_timeout(500)
+    A.shot('32-editor')
+    A.page.keyboard.press('Escape')
+    A.page.wait_for_timeout(300)
+    A.page.click('.tabs [data-tab="shelf"]'); A.page.wait_for_timeout(400); A.shot('33-shelf')
+    A.page.click('.spine[data-id="site"]'); A.page.wait_for_timeout(400); A.shot('34-book')
+    A.page.click('.tabs [data-tab="stats"]'); A.page.wait_for_timeout(400); A.shot('35-stats')
+    b.close()
+print(ERRORS)

@@ -2,7 +2,7 @@
 'use strict';
 const Y = YK;
 const APP_URL = (location.origin + location.pathname).replace(/index\.html$/, '');
-const VERSION = '2.0';
+const VERSION = '3.0';
 const CFG = window.YK_FIREBASE || null;
 const OWNER = String(window.YK_OWNER || '').toLowerCase();
 const COLORS = ['#2B6A60', '#2D4A7A', '#55652A', '#8C5E1E', '#9C3F33', '#6E3F66', '#4A5157', '#6B4A35', '#3B6E8F', '#7A6A2E'];
@@ -15,12 +15,22 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const coarse = () => { try { return matchMedia('(pointer: coarse)').matches; } catch (e) { return false; } };
 const parseAmount = (s) => { const n = Math.round(Number(String(s || '').replace(/[^\d.]/g, ''))); return Number.isFinite(n) ? n : 0; };
+const fmtBytes = (b) => { b = Number(b) || 0; if (b >= 1073741824) return (b / 1073741824).toFixed(1).replace(/\.0$/, '') + 'GB'; if (b >= 1048576) return (b / 1048576).toFixed(b >= 104857600 ? 0 : 1).replace(/\.0$/, '') + 'MB'; if (b >= 1024) return Math.round(b / 1024) + 'KB'; return b + 'B'; };
+const randHex = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n))).map((b) => b.toString(16).padStart(2, '0')).join('');
+function ago(ms) {
+  if (!ms) return '';
+  const s = (Date.now() - ms) / 1000;
+  if (s < 90) return '방금';
+  if (s < 3600) return `${Math.round(s / 60)}분 전`;
+  if (s < 86400) return `${Math.round(s / 3600)}시간 전`;
+  const d = Math.round(s / 86400);
+  return d === 1 ? '어제' : `${d}일 전`;
+}
 
 const LS = {
   get(k) { try { const v = localStorage.getItem(k); return v == null ? null : JSON.parse(v); } catch (e) { return null; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } },
-  ok() { try { localStorage.setItem('__yk', '1'); localStorage.removeItem('__yk'); return true; } catch (e) { return false; } },
 };
 
 const ICON = {
@@ -54,6 +64,9 @@ const ICON = {
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
   refresh: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4.2h-4.2"/>',
   arrows: '<path d="M8 7h11M15.5 3.5 19 7l-3.5 3.5M16 17H5M8.5 13.5 5 17l3.5 3.5"/>',
+  box: '<path d="M4 7.5 12 4l8 3.5v9L12 20l-8-3.5z"/><path d="M4 7.5 12 11l8-3.5M12 11v9"/>',
+  phone: '<rect x="7" y="3" width="10" height="18" rx="2"/><path d="M11 17.5h2"/>',
+  cloud: '<path d="M7.5 18.5h10a4 4 0 0 0 .6-8 6 6 0 0 0-11.6 1.6A3.3 3.3 0 0 0 7.5 18.5z"/>',
 };
 const ic = (n) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICON[n] || ''}</svg>`;
 
@@ -62,15 +75,21 @@ const S = {
   tab: 'log', mode: 'd', composeDate: Y.today(), curSec: null,
   book: null, bookView: {}, bookRange: {}, bookFrom: {}, bookTo: {}, bookPer: {}, bookSort: {}, groupBy: {},
   statsRange: 'month', statsFrom: '', statsTo: '',
-  orgRunning: new Set(), aiBlocked: '', freshIds: new Set(), pendFiles: [], uploading: 0,
-  remMsg: {}, usage: null, todayAtBoot: Y.today(), userEmail: '',
+  orgRunning: new Set(), freshIds: new Set(), pendFiles: [], uploading: 0,
+  remMsg: {}, todayAtBoot: Y.today(),
   stickBottom: true, scrollToEnd: true, renderDeferred: false, chartDir: 'out',
+  store: null, cloudInfo: null,
 };
 const D = {
-  mode: 'boot', uid: null, base: '', books: new Map(), settings: Y.defaultSettings(), index: { months: {} }, indexExists: false,
-  entries: new Map(), months: new Map(), pending: 0, failed: new Map(), ready: false, localReason: '', unsubMeta: null,
+  mode: 'boot',           // 'device': kept in this device's store · 'memory': nothing can be kept
+  books: new Map(), settings: Y.defaultSettings(), index: { months: {} },
+  entries: new Map(), months: new Map(), ready: false,
+  user: null,             // signed-in owner {uid, email}
+  cloud: 'loading',       // 'loading' | 'none' (no relay configured) | 'ready'
+  pendingLocal: 0, saveErr: '', persisted: null,
 };
-const CAP = { db: null, auth: null, user: null, assets: null, sample: null, downloads: null, mcp: null, perms: null };
+const DEV = { id: '', name: '', first: 0 };
+const CAP = { db: null, auth: null };
 
 const booksArr = () => Array.from(D.books.values()).sort((a, b) => (a.order - b.order) || (a.created - b.created) || a.name.localeCompare(b.name));
 const notebooks = () => booksArr().filter((b) => b.kind === 'note');
@@ -83,206 +102,83 @@ const saveUi = () => LS.set('yk:ui', { mode: S.mode, bookView: S.bookView, bookR
 let rq = 0;
 function scheduleRender() { if (rq) return; rq = requestAnimationFrame(() => { rq = 0; render(); }); }
 
-// ---------- writes ----------
-// Firebase keeps its own durable offline queue, so every change is handed over at once
-// (nothing waits in memory, nothing is lost if the app closes while offline).
-const Q = new Map(); // path -> writes not yet confirmed by the server
-const docPath = (rel) => `${D.base}/${rel}`;
-const entryRel = (id, m) => `m${m}/e/${id}`;
-const hasQueued = (rel) => Q.has(docPath(rel));
+// ---------- versions: a clock that never runs backwards on this device ----------
+let lastV = 0;
+let hlcTimer = 0;
+function nextV() {
+  const n = Date.now();
+  lastV = n > lastV ? n : lastV + 1;
+  clearTimeout(hlcTimer); hlcTimer = setTimeout(() => { if (D.mode === 'device') STORE.setMeta('hlc', lastV).catch(() => {}); }, 400);
+  return lastV;
+}
+function seenV(v) { if (v > lastV) lastV = v; }
 
-function trackWrite(path, p, onFail) {
-  Q.set(path, (Q.get(path) || 0) + 1);
-  D.pending++;
+const recKey = (k, id) => `${k}-${id}`;
+function makeRec(k, id, data) {
+  const r = { key: recKey(k, id), k, id, v: nextV(), dv: DEV.id, del: 0, d: data, dirty: 1 };
+  if (k === 'e') r.m = Y.monthOf(data.date);
+  return r;
+}
+function tombstone(k, id) { return { key: recKey(k, id), k, id, v: nextV(), dv: DEV.id, del: 1, d: null, dirty: 1 }; }
+
+// ---------- saving on this device ----------
+let chain = Promise.resolve();
+const memRecs = new Map(); // memory mode only
+function persist(rec, after) {
+  if (D.mode !== 'device') { memRecs.set(rec.key, rec); if (after) after(); return Promise.resolve(); }
+  D.pendingLocal++;
   updateSync();
-  p.catch(onFail).finally(() => {
-    const n = (Q.get(path) || 1) - 1;
-    if (n > 0) Q.set(path, n); else Q.delete(path);
-    D.pending--;
-    updateSync();
-  });
+  const p = chain = chain.then(() => STORE.put(rec)).then(() => {
+    if (D.saveErr) { D.saveErr = ''; scheduleRender(); }
+    if (after) after();
+    SYNC.kick();
+    BUS.post({ t: 'rec', key: rec.key });
+  }).catch((e) => {
+    console.warn('[엮음] save failed', e);
+    D.saveErr = (e && e.name) || 'error';
+    toast(e && e.name === 'QuotaExceededError' ? '이 기기 저장 공간이 가득 차서 저장하지 못했어요. 휴대폰 저장 공간을 비워 주세요.' : '이 기기에 저장하지 못했어요. 앱을 다시 열어 주세요.', { long: true });
+    scheduleRender();
+  }).finally(() => { D.pendingLocal--; updateSync(); });
+  return p;
 }
 
-function enqueue(rel, op, data) {
-  if (D.mode !== 'cloud') { persistLocalSoon(); return; }
-  const path = docPath(rel);
-  const job = { op, data };
-  let p;
-  try {
-    const ref = CAP.db.doc(path);
-    p = op === 'set' ? ref.set(data) : op === 'update' ? ref.set(data, { merge: true }) : ref.delete();
-  } catch (e) { onWriteError(e, path, job, rel); return; }
-  D.failed.delete(path);
-  trackWrite(path, p, (e) => onWriteError(e, path, job, rel));
-}
-
-function onWriteError(e, path, job, rel) {
-  const c = (e && e.code) || 'error';
-  console.warn('[엮음] write failed', c, path, e);
-  if (rel) D.failed.set(path, { rel, job });
-  if (c === 'permission-denied' || c === 'unauthenticated') toast('이 계정으로는 저장할 수 없어요. 설정에서 로그인한 계정을 확인해 주세요.', { long: true });
-  else if (c === 'resource-exhausted') toast('오늘 무료 저장 한도를 넘었어요. 한국 시간 오후 4~5시쯤 한도가 다시 채워지면 ‘저장 실패’를 눌러 다시 저장하세요.', { long: true });
-  else if (c === 'invalid-argument') toast('저장할 수 없는 내용이 있어요. 글이나 첨부가 너무 크지 않은지 확인해 주세요.', { long: true });
-  else toast('저장하지 못한 내용이 있어요. 상단의 ‘저장 실패’를 눌러 다시 시도하세요.', { long: true });
-  updateSync();
-}
-
-function retryFailed() {
-  const jobs = Array.from(D.failed.values());
-  D.failed.clear();
-  for (const { rel, job } of jobs) enqueue(rel, job.op, job.data);
-  updateSync();
-}
-
-// ---------- local fallback ----------
-let lsTimer = 0;
-function persistLocalSoon() {
-  if (D.mode !== 'local') return;
-  clearTimeout(lsTimer);
-  lsTimer = setTimeout(() => {
-    const ok = LS.set('yk:data', {
-      v: 1,
-      books: booksArr().map((b) => Object.assign({ id: b.id }, Y.bookDoc(b))),
-      settings: D.settings,
-      index: D.index,
-      entries: Array.from(D.entries.values()).map((e) => Object.assign({ id: e.id }, Y.entryDoc(e))),
-    });
-    if (!ok) toast('이 기기 저장 공간이 부족해 저장하지 못했어요.');
-  }, 300);
-}
-
-function initLocal(reason) {
-  D.mode = LS.ok() ? 'local' : 'memory';
-  D.localReason = reason || '';
-  const saved = D.mode === 'local' ? LS.get('yk:data') : null;
-  if (saved && Array.isArray(saved.books) && saved.books.length) {
-    for (const b of saved.books) D.books.set(b.id, Y.normBook(b.id, b));
-    D.settings = Y.normSettings(saved.settings);
-    D.index = { months: Object.assign({}, (saved.index && saved.index.months) || {}) };
-    for (const e of saved.entries || []) { const x = Y.normEntry(e.id, e); x._m = Y.monthOf(x.date); D.entries.set(x.id, x); }
-  } else {
-    for (const b of Y.defaultBooks()) D.books.set(b.id, b);
-    D.settings = Y.defaultSettings();
-  }
-  D.indexExists = true;
-  D.ready = true;
-  render();
-  afterReady();
-}
-
-// ---------- cloud ----------
-async function initCloud(uid) {
-  D.mode = 'cloud'; D.uid = uid; D.base = `data/users/${uid}`;
-  const sref = CAP.db.doc(docPath('settings'));
-  let snap = null;
-  try {
-    snap = await sref.get();
-    // a missing document read from this device's cache may only mean "never synced here yet"
-    if (!snap.exists && snap.metadata && snap.metadata.fromCache) snap = await sref.get({ source: 'server' });
-  } catch (e) {
-    if (e && e.code === 'permission-denied') { showGate('denied'); return; }
-    console.warn('[엮음] settings read failed', e);
-    showGate('offline');
-    window.addEventListener('online', () => location.reload(), { once: true });
-    return;
-  }
-  await new Promise((resolve) => {
-    let done = false;
-    const finish = () => { if (!done) { done = true; resolve(); } };
-    setTimeout(finish, 6000);
-    D.unsubMeta = CAP.db.collection(D.base).onSnapshot((qs) => {
-      for (const ch of qs.docChanges()) {
-        const id = ch.doc.id;
-        if (ch.type === 'removed') { if (id.startsWith('b-')) D.books.delete(id.slice(2)); continue; }
-        const data = ch.doc.data() || {};
-        if (id === 'settings') { if (!hasQueued('settings')) D.settings = Y.normSettings(data); }
-        else if (id === 'index') { D.indexExists = true; if (!hasQueued('index')) D.index = { months: Object.assign({}, data.months || {}) }; }
-        else if (id.startsWith('b-')) { if (!hasQueued(id)) D.books.set(id.slice(2), Y.normBook(id.slice(2), data)); }
-      }
-      finish();
-      scheduleRender();
-    }, (err) => {
-      console.warn('[엮음] meta subscription ended', err);
-      if (err && err.code === 'permission-denied') showGate('denied');
-      finish();
-    });
-  });
-  if (!snap.exists) firstRun(); else D.settings = Y.normSettings(snap.data());
-  const m0 = Y.monthOf(Y.today());
-  await Promise.all([ensureMonth(m0, true), ensureMonth(Y.addMonths(m0, -1), true)]);
-  D.ready = true;
-  hideGate();
-  render();
-  afterReady();
-}
-
-function firstRun() {
-  const books = Y.defaultBooks();
-  for (const b of books) { if (!D.books.has(b.id)) { D.books.set(b.id, b); enqueue('b-' + b.id, 'set', Y.bookDoc(b)); } }
-  D.settings = Y.defaultSettings();
-  enqueue('settings', 'set', D.settings);
-}
-
-function putEntry(id, data, m) {
+// ---------- months: entries are read from this device month by month ----------
+function putEntryMem(id, data, v) {
   const e = Y.normEntry(id, data);
-  e._m = m;
+  e._m = Y.monthOf(e.date);
+  e._v = v || 0;
   D.entries.set(id, e);
   return e;
 }
 
-// month loading: live (current + previous month) or one-off reads, at most 3 reads at a time
-const loadWait = [];
-let loadActive = 0;
-function ensureMonth(m, live) {
+function ensureMonth(m) {
   const st = D.months.get(m);
   if (st) return st.promise;
   let resolve;
   const promise = new Promise((r) => { resolve = r; });
-  const rec = { state: 'loading', live: !!live, promise, unsub: null };
+  const rec = { state: 'loading', promise };
   D.months.set(m, rec);
-  if (D.mode !== 'cloud') { rec.state = 'ready'; resolve(); return promise; }
-  const coll = CAP.db.collection(`${D.base}/m${m}/e`).limit(1000);
-  const replaceMonth = (docs) => {
-    const ids = new Set(docs.map((d) => d.id));
-    for (const [id, e] of D.entries) if (e._m === m && !ids.has(id) && !hasQueued(entryRel(id, m))) D.entries.delete(id);
-    for (const d of docs) if (!hasQueued(entryRel(d.id, m))) putEntry(d.id, d.data(), m);
-  };
-  if (live) {
-    let first = true;
-    rec.unsub = coll.onSnapshot((qs) => {
-      if (first) { first = false; replaceMonth(qs.docs); rec.state = 'ready'; resolve(); }
-      else {
-        for (const ch of qs.docChanges()) {
-          const id = ch.doc.id;
-          if (hasQueued(entryRel(id, m))) continue;
-          if (ch.type === 'removed') { const cur = D.entries.get(id); if (cur && cur._m === m) D.entries.delete(id); }
-          else putEntry(id, ch.doc.data(), m);
-        }
-      }
-      scheduleRender();
-    }, (err) => {
-      console.warn('[엮음] month subscription ended', m, err);
-      if (rec.state !== 'ready') { rec.state = 'ready'; resolve(); }
-      rec.live = false;
-    });
-  } else {
-    const run = () => {
-      loadActive++;
-      coll.get().then((qs) => { replaceMonth(qs.docs); rec.state = 'ready'; })
-        .catch((err) => { console.warn('[엮음] month read failed', m, err); D.months.delete(m); toast(`${Y.fmtMonth(m)} 기록을 불러오지 못했어요.`); })
-        .finally(() => { loadActive--; resolve(); scheduleRender(); const nx = loadWait.shift(); if (nx) nx(); });
-    };
-    if (loadActive < 3) run(); else loadWait.push(run);
+  if (D.mode !== 'device') {
+    for (const r of memRecs.values()) if (r.k === 'e' && !r.del && r.m === m && !D.entries.has(r.id)) putEntryMem(r.id, r.d, r.v);
+    rec.state = 'ready'; resolve(); return promise;
   }
+  STORE.byMonth(m).then((list) => {
+    for (const r of list) {
+      if (r.k !== 'e' || r.del || !r.d) continue;
+      const cur = D.entries.get(r.id);
+      if (cur && (cur._v || 0) > r.v) continue; // a newer copy is already on screen
+      putEntryMem(r.id, r.d, r.v);
+    }
+    rec.state = 'ready';
+  }).catch((e) => { console.warn('[엮음] month read failed', m, e); D.months.delete(m); })
+    .finally(() => { resolve(); scheduleRender(); });
   return promise;
 }
 
 const monthReady = (m) => { const s = D.months.get(m); return !!(s && s.state === 'ready'); };
 function needMonths(ms) {
   const missing = ms.filter((m) => !monthReady(m));
-  if (!missing.length) return true;
-  if (D.mode === 'cloud') missing.forEach((m) => ensureMonth(m, false));
-  else missing.forEach((m) => ensureMonth(m, false));
+  missing.forEach((m) => ensureMonth(m));
   return missing.every((m) => monthReady(m));
 }
 function monthsForRange(from, to) {
@@ -291,57 +187,94 @@ function monthsForRange(from, to) {
   return all.filter((m) => known.has(m) || m === Y.monthOf(Y.today()) || m === Y.addMonths(Y.monthOf(Y.today()), -1));
 }
 function monthsWithBook(id) {
-  return Object.keys(D.index.months || {}).filter((m) => (parseB(D.index.months[m].b)[id] || 0) > 0).sort();
+  return Object.keys(D.index.months || {}).filter((m) => ((D.index.months[m].b || {})[id] || 0) > 0).sort();
 }
 async function loadMonthsWithProgress(ms, onProg) {
   let done = 0;
   const todo = ms.filter((m) => !monthReady(m));
-  if (!todo.length) { onProg && onProg(1, 1); return; }
-  await Promise.all(todo.map((m) => ensureMonth(m, false).then(() => { done++; onProg && onProg(done, todo.length); })));
+  if (!todo.length) { if (onProg) onProg(1, 1); return; }
+  await Promise.all(todo.map((m) => ensureMonth(m).then(() => { done++; if (onProg) onProg(done, todo.length); })));
 }
 
-// ---------- index (per-month summary, keeps book page counts cheap) ----------
-function parseB(list) {
-  const o = {};
-  for (const s of Array.isArray(list) ? list : []) { const i = String(s).lastIndexOf(':'); if (i > 0) o[s.slice(0, i)] = Number(s.slice(i + 1)) || 0; }
-  return o;
-}
-function monthSummary(m) {
-  let n = 0;
-  const counts = new Map();
-  for (const e of D.entries.values()) {
-    if (e._m !== m) continue;
-    n++;
-    for (const id of Y.linkedBookIds(e, null)) counts.set(id, (counts.get(id) || 0) + 1);
-  }
-  return { n, b: Array.from(counts, ([k, v]) => `${k}:${v}`).sort() };
-}
-const idxTimers = new Map();
+// ---------- index: per-month counts kept on this device (book page counts, older months) ----------
+const touched = new Set();
+let idxTimer = 0, idxSaveTimer = 0;
 function touchMonth(m) {
-  if (!m) return;
-  clearTimeout(idxTimers.get(m));
-  idxTimers.set(m, setTimeout(() => commitMonth(m), 900));
+  if (!m || !/^\d{4}-\d{2}$/.test(m)) return;
+  touched.add(m);
+  clearTimeout(idxTimer);
+  idxTimer = setTimeout(recountTouched, 80);
 }
-function commitMonth(m) {
-  idxTimers.delete(m);
-  if (!monthReady(m)) { ensureMonth(m, false).then(() => touchMonth(m)); return; }
-  const sum = monthSummary(m);
-  const prev = D.index.months[m];
-  if (prev && JSON.stringify(prev) === JSON.stringify(sum)) return;
-  D.index.months[m] = sum;
-  if (D.mode === 'cloud') {
-    D.indexExists = true;
-    enqueue('index', 'update', { months: { [m]: sum } });
-  } else persistLocalSoon();
+async function recountTouched() {
+  const ms = Array.from(touched);
+  touched.clear();
+  for (const m of ms) {
+    let list;
+    if (D.mode === 'device') { try { list = await STORE.byMonth(m); } catch (e) { continue; } }
+    else list = Array.from(memRecs.values()).filter((r) => r.m === m);
+    D.index.months[m] = monthSummary(list.filter((r) => r.k === 'e' && !r.del && r.d));
+    if (!D.index.months[m].n) delete D.index.months[m];
+  }
+  saveIndexSoon();
   scheduleRender();
+}
+function monthSummary(recs) {
+  const b = {};
+  for (const r of recs) for (const id of Y.linkedBookIds(Y.normEntry(r.id, r.d), null)) b[id] = (b[id] || 0) + 1;
+  return { n: recs.length, b };
+}
+function saveIndexSoon() {
+  if (D.mode !== 'device') return;
+  clearTimeout(idxSaveTimer);
+  idxSaveTimer = setTimeout(() => STORE.setMeta('index', D.index).catch(() => {}), 300);
+}
+async function rebuildIndex() {
+  const months = {};
+  await STORE.eachKind('e', (r) => {
+    if (r.del || !r.d) return;
+    const m = r.m || Y.monthOf(r.d.date);
+    const x = months[m] || (months[m] = { n: 0, b: {} });
+    x.n++;
+    for (const id of Y.linkedBookIds(Y.normEntry(r.id, r.d), null)) x.b[id] = (x.b[id] || 0) + 1;
+  });
+  D.index = { v: 3, months };
+  await STORE.setMeta('index', D.index);
 }
 function bookCount(id) {
   let n = 0;
-  for (const m of Object.keys(D.index.months || {})) n += parseB(D.index.months[m].b)[id] || 0;
+  for (const m of Object.keys(D.index.months || {})) n += (D.index.months[m].b || {})[id] || 0;
   return n;
 }
 function totalCount() { let n = 0; for (const v of Object.values(D.index.months || {})) n += Number(v && v.n) || 0; return n; }
 function bookSince(id) { const ms = monthsWithBook(id); return ms.length ? ms[0].replace('-', '.') : ''; }
+
+// ---------- records arriving from other devices (or another tab, a backup, the old version) ----------
+function applyChanges(changes) {
+  let ui = false;
+  for (const c of changes) {
+    if (!c || c.resend || !c.rec) continue;
+    const { old, rec } = c;
+    seenV(rec.v);
+    if (rec.k === 'e') {
+      const oldM = old && !old.del && old.d ? Y.monthOf(Y.normEntry(old.id, old.d).date) : null;
+      if (rec.del || !rec.d) D.entries.delete(rec.id);
+      else {
+        const m = Y.monthOf(Y.normEntry(rec.id, rec.d).date);
+        if (monthReady(m)) putEntryMem(rec.id, rec.d, rec.v); else D.entries.delete(rec.id);
+        touchMonth(m);
+      }
+      if (oldM) touchMonth(oldM);
+      ui = true;
+    } else if (rec.k === 'b') {
+      if (rec.del || !rec.d) D.books.delete(rec.id); else D.books.set(rec.id, Y.normBook(rec.id, rec.d));
+      ui = true;
+    } else if (rec.k === 's' && rec.d && !rec.del) {
+      D.settings = Y.normSettings(rec.d);
+      ui = true;
+    }
+  }
+  if (ui) scheduleRender();
+}
 
 // ---------- entries ----------
 function newEntry(o) {
@@ -356,35 +289,35 @@ function saveEntry(entry, opts) {
   if (!e.created) e.created = Date.now();
   const old = D.entries.get(e.id);
   const m = Y.monthOf(e.date);
-  e._m = m;
+  const rec = makeRec('e', e.id, Y.entryDoc(e));
+  e._m = m; e._v = rec.v;
   D.entries.set(e.id, e);
-  enqueue(entryRel(e.id, m), 'set', Y.entryDoc(e));
-  if (old && old._m && old._m !== m) { enqueue(entryRel(e.id, old._m), 'delete'); touchMonth(old._m); }
-  if (!D.months.has(m)) ensureMonth(m, false);
-  touchMonth(m);
+  if (!D.months.has(m)) ensureMonth(m);
+  persist(rec, () => { touchMonth(m); if (old && old._m && old._m !== m) touchMonth(old._m); });
+  FILES.attach(e.files.map((f) => f.id));
   if (!opts.quiet) scheduleRender();
   return e;
 }
 
 function removeEntry(e, keepFiles) {
   D.entries.delete(e.id);
-  enqueue(entryRel(e.id, e._m || Y.monthOf(e.date)), 'delete');
-  touchMonth(e._m || Y.monthOf(e.date));
-  if (!keepFiles) for (const f of e.files || []) deleteAsset(f.id);
+  const m = e._m || Y.monthOf(e.date);
+  persist(tombstone('e', e.id), () => touchMonth(m));
+  if (!keepFiles) for (const f of e.files || []) FILES.remove(f.id);
   scheduleRender();
 }
 
 function saveBook(b) {
   const nb = Y.normBook(b.id, b);
   D.books.set(nb.id, nb);
-  enqueue('b-' + nb.id, 'set', Y.bookDoc(nb));
+  persist(makeRec('b', nb.id, Y.bookDoc(nb)));
   scheduleRender();
   return nb;
 }
 
 function removeBook(id) {
   D.books.delete(id);
-  enqueue('b-' + id, 'delete');
+  persist(tombstone('b', id));
   if (D.settings.defaultLedger === id) { const l = ledgers()[0]; D.settings.defaultLedger = l ? l.id : ''; saveSettings(); }
   scheduleRender();
 }
@@ -392,13 +325,7 @@ function removeBook(id) {
 let setTimer = 0;
 function saveSettings() {
   clearTimeout(setTimer);
-  setTimer = setTimeout(() => enqueue('settings', 'set', clone(D.settings)), 250);
-  if (D.mode !== 'cloud') persistLocalSoon();
-}
-
-function deleteAsset(id) {
-  if (!CAP.assets || !id) return;
-  CAP.assets.delete(id).catch((e) => console.warn('[엮음] asset delete failed', e));
+  setTimer = setTimeout(() => persist(makeRec('s', 'main', clone(D.settings))), 250);
 }
 
 function entriesBetween(from, to) {
@@ -425,3 +352,38 @@ function rangeDates(key, from, to) {
   return null;
 }
 const RANGE_LABEL = { week: '이번 주', month: '이번 달', last: '지난 달', year: '올해', all: '전체', custom: '기간' };
+
+// ---------- other tabs of this app on the same device ----------
+const BUS = (() => {
+  let ch = null;
+  try { ch = new BroadcastChannel('yeokkeum'); } catch (e) { ch = null; }
+  const handlers = [];
+  if (ch) ch.onmessage = (ev) => { for (const h of handlers) { try { h(ev.data || {}); } catch (e) { console.warn(e); } } };
+  return { post(m) { if (ch) { try { ch.postMessage(m); } catch (e) { /* ignore */ } } }, on(h) { handlers.push(h); } };
+})();
+const tabKeys = new Set();
+let tabTimer = 0;
+BUS.on((m) => {
+  if (D.mode !== 'device') return;
+  if (m.t === 'rec' && m.key) {
+    tabKeys.add(m.key);
+    clearTimeout(tabTimer);
+    tabTimer = setTimeout(reloadTabKeys, 120);
+    SYNC.kick();
+  } else if (m.t === 'file') {
+    SYNC.kick();
+    scheduleRender();
+  }
+});
+async function reloadTabKeys() {
+  const keys = Array.from(tabKeys); tabKeys.clear();
+  const changes = [];
+  for (const key of keys) {
+    const rec = await STORE.getRec(key).catch(() => null);
+    if (!rec) continue;
+    let old = null;
+    if (rec.k === 'e') { const cur = D.entries.get(rec.id); if (cur && (cur._v || 0) >= rec.v) continue; if (cur) old = { id: cur.id, d: Y.entryDoc(cur), del: 0 }; }
+    changes.push({ old, rec });
+  }
+  applyChanges(changes);
+}

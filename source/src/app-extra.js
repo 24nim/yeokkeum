@@ -38,7 +38,7 @@ function quickSave() {
   const e = newEntry({ text, date: S.composeDate, files: S.pendFiles.slice() });
   e.org = text ? { st: 'pending' } : { st: 'manual' };
   ta.value = ''; autosize(ta); LS.del('yk:draft');
-  S.pendFiles = [];
+  S.pendFiles = []; savePend();
   const saved = saveEntry(e);
   S.freshIds.add(saved.id);
   S.scrollToEnd = true;
@@ -118,10 +118,10 @@ function openSearch() {
 }
 
 // ================= attachments =================
-const ACCEPT = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'text/csv', 'text/markdown', 'application/json']);
-const EXT_TYPE = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', md: 'text/markdown', json: 'application/json' };
-const TYPE_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'application/pdf': 'pdf', 'text/plain': 'txt', 'text/csv': 'csv', 'text/markdown': 'md', 'application/json': 'json' };
-const MAX_DOC = 5 * 1048576;
+const IMG_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const EXT_TYPE = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', heic: 'image/heic', heif: 'image/heif', pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', md: 'text/markdown', json: 'application/json', hwp: 'application/x-hwp', hwpx: 'application/haansofthwpx', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', zip: 'application/zip', dwg: 'application/acad', dxf: 'application/dxf' };
+const TYPE_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/heic': 'heic', 'image/heif': 'heif', 'application/pdf': 'pdf', 'text/plain': 'txt', 'text/csv': 'csv', 'text/markdown': 'md', 'application/json': 'json', 'application/zip': 'zip' };
+const MAX_DOC = 15 * 1048576;
 const uerr = (msg) => Object.assign(new Error(msg), { userMsg: msg });
 
 async function drawImage(file, max, q, asDataUrl) {
@@ -133,44 +133,42 @@ async function drawImage(file, max, q, asDataUrl) {
   const g = c.getContext('2d');
   g.fillStyle = '#FFFFFF'; g.fillRect(0, 0, c.width, c.height);
   g.drawImage(bmp, 0, 0, c.width, c.height);
+  if (bmp.close) bmp.close();
   if (asDataUrl) return c.toDataURL('image/jpeg', q);
   return new Promise((r) => c.toBlob(r, 'image/jpeg', q));
 }
 
 async function prepareFile(file) {
   const ext = (file.name.split('.').pop() || '').toLowerCase();
-  if (/^(hwp|hwpx|doc|docx|xls|xlsx|ppt|pptx|zip)$/.test(ext)) throw uerr(`${file.name}: 한글·워드·엑셀 파일은 아직 첨부할 수 없어요. PDF로 저장해서 올려 주세요.`);
-  if (/^(heic|heif)$/.test(ext) || /heic|heif/.test(file.type)) throw uerr(`${file.name}: HEIC 사진은 올릴 수 없어요. 카메라 설정에서 사진 형식을 JPG로 바꾸거나 변환해서 올려 주세요.`);
-  if (/^video\//.test(file.type) || /^(mp4|mov|webm|avi)$/.test(ext)) throw uerr(`${file.name}: 동영상은 무료 저장 공간을 많이 차지해서 넣을 수 없어요.`);
-  const type = ACCEPT.has(file.type) ? file.type : EXT_TYPE[ext];
-  if (!type) throw uerr(`${file.name}: 사진, PDF, 텍스트 파일만 첨부할 수 있어요.`);
-  let name = file.name || `파일.${TYPE_EXT[type]}`;
-  if (/^image\//.test(type)) {
-    // photos are shrunk so the free 1GB lasts: about 1600px, usually 200~500KB
-    let blob, thumb = '';
+  if (/^video\//.test(file.type) || /^(mp4|mov|webm|avi|mkv|3gp|m4v)$/.test(ext)) throw uerr(`${file.name}: 동영상은 너무 커서 넣을 수 없어요.`);
+  const type = file.type || EXT_TYPE[ext] || 'application/octet-stream';
+  let name = file.name || `파일.${TYPE_EXT[type] || 'bin'}`;
+  if (IMG_TYPES.has(type) || (/^image\//.test(type) && !/heic|heif/.test(type))) {
+    // photos are kept at about 1600px (usually 200~500KB): sharp enough to read, light to carry
+    let blob = null, thumb = '';
     try {
       blob = await drawImage(file, 1600, 0.82, false);
-      thumb = await drawImage(file, 240, 0.62, true);
-    } catch (e) { throw uerr(`${file.name}: 이 사진을 읽지 못했어요.`); }
-    if (!blob) throw uerr(`${file.name}: 이 사진을 읽지 못했어요.`);
-    name = name.replace(/\.(png|webp|jpe?g|gif)$/i, '') + '.jpg';
-    return { blob, type: 'image/jpeg', name, thumb };
+      thumb = await drawImage(file, 200, 0.6, true);
+    } catch (e) { blob = null; }
+    if (blob) { name = name.replace(/\.(png|webp|jpe?g|gif|bmp)$/i, '') + '.jpg'; return { blob, type: 'image/jpeg', name, thumb }; }
+    if (file.size > MAX_DOC) throw uerr(`${file.name}: 이 사진을 읽지 못했어요.`);
+    return { blob: file, type, name, thumb: '' };
   }
-  if (file.size > MAX_DOC) throw uerr(`${file.name}: PDF와 문서는 5MB까지 넣을 수 있어요.`);
+  if (file.size > MAX_DOC) throw uerr(`${file.name}: 파일은 15MB까지 넣을 수 있어요.`);
   return { blob: file, type, name, thumb: '' };
 }
 
 async function uploadOne(file) {
   const p = await prepareFile(file);
-  let r;
-  try { r = await CAP.assets.upload(p.blob, { type: p.type, name: p.name }); }
-  catch (e) { console.warn('[엮음] upload', e); throw uerr(`${p.name}: 올리지 못했어요.`); }
-  return { id: r.id, name: p.name, type: r.contentType || p.type, size: r.sizeBytes || p.blob.size, label: '', t: p.thumb };
+  try { return await FILES.add(p); }
+  catch (e) {
+    console.warn('[엮음] keep file', e);
+    throw uerr(e && e.name === 'QuotaExceededError' ? `${p.name}: 이 기기 저장 공간이 부족해요.` : `${p.name}: 저장하지 못했어요.`);
+  }
 }
 
 let pickTarget = 'composer';
 function pickFiles(target) {
-  if (!CAP.assets) { toast('계정에 로그인해야 사진과 파일을 넣을 수 있어요'); return; }
   pickTarget = target;
   const inp = $('#file-pick'); inp.value = ''; inp.click();
 }
@@ -182,12 +180,13 @@ async function onFilesPicked(list) {
   for (const file of files) {
     try {
       const f = await uploadOne(file);
-      if (target === 'editor') { if (ED) { ED.draft.files.push(f); ED.uploaded.push(f.id); } else deleteAsset(f.id); }
-      else S.pendFiles.push(f);
+      if (target === 'editor') { if (ED) { ED.draft.files.push(f); ED.uploaded.push(f.id); } else FILES.remove(f.id); }
+      else { S.pendFiles.push(f); savePend(); }
     } catch (e) { toast(e && e.userMsg ? e.userMsg : '파일을 넣지 못했어요', { long: true }); }
     finally { S.uploading--; renderComposer(); if (ED) renderEditor(); }
   }
 }
+function savePend() { if (S.pendFiles.length) LS.set('yk:pendFiles', S.pendFiles); else LS.del('yk:pendFiles'); }
 
 async function saveFile(filename, data) {
   try { await DOWNLOADS.save({ filename, data }); toast('파일을 저장했어요. 내 파일 → 다운로드에서 볼 수 있어요.'); return true; }
@@ -199,9 +198,18 @@ function fileName(f) {
   if (!/\.[a-z0-9]{2,5}$/i.test(name)) name += '.' + (TYPE_EXT[f.type] || 'bin');
   return name;
 }
+function fileErrMsg(e) {
+  const c = e && e.code;
+  if (c === 'signed-out') return '원본이 이 기기에 없어요. 로그인하면 다른 기기에서 받아올 수 있어요.';
+  if (c === 'notyet') return '원본이 아직 이 기기로 오지 않았어요. 사진을 넣은 기기에서 인터넷이 될 때 앱을 열면 전달돼요.';
+  if (c === 'evicted') return e.wanted ? '받아오기를 요청해 뒀어요. 원본이 있는 기기에서 앱을 열면 전달돼요.' : '원본이 다른 기기에만 있어요.';
+  if (c === 'deleted') return '이 파일은 지워졌어요.';
+  if (!navigator.onLine || c === 'unavailable') return '원본이 이 기기에 없어요. 인터넷에 연결되면 받아올 수 있어요.';
+  return '원본을 불러오지 못했어요.';
+}
 async function fileBlob(f) {
   try { return await FILES.get(f.id); }
-  catch (e) { toast(navigator.onLine ? '이 파일을 찾지 못했어요.' : '인터넷에 연결되면 이 파일을 열 수 있어요.'); return null; }
+  catch (e) { toast(fileErrMsg(e), { long: true }); return null; }
 }
 async function saveAssetToDevice(f) { const b = await fileBlob(f); if (b) saveFile(fileName(f), b); }
 async function shareAsset(f) { const b = await fileBlob(f); if (b) shareFile(fileName(f), b, f.name); }
@@ -236,28 +244,41 @@ function openFileViewer(f) {
   acts.push({ label: '기기에 저장', icon: 'download', run: () => saveAssetToDevice(f) });
   const L = dialog({
     title: f.name + (f.label ? ` · ${f.label}` : ''), cls: 'full',
-    body: `<div class="viewer">${f.t ? `<img id="fv-img" src="${esc(f.t)}" alt="${esc(f.name)}">` : ''}<p class="hint" id="fv-msg">불러오는 중…</p><div id="fv-pages" class="viewer" style="width:100%"></div></div>`,
+    body: `<div class="viewer">${f.t ? `<img id="fv-img" src="${esc(f.t)}" alt="${esc(f.name)}">` : ''}<p class="hint" id="fv-msg">불러오는 중…</p><div id="fv-act"></div><div id="fv-pages" class="viewer" style="width:100%"></div></div>`,
     actions: acts,
+    onClose: () => { if (L && L._url) URL.revokeObjectURL(L._url); },
   });
   FILES.get(f.id).then(async (blob) => {
     if (!document.contains(L.dlg)) return;
     const msg = $('#fv-msg', L.dlg);
-    if (/^image\//.test(blob.type)) {
-      const url = URL.createObjectURL(blob);
+    const type = blob.type || f.type || '';
+    if (/^image\//.test(type) && !/heic|heif/.test(type)) {
+      const url = URL.createObjectURL(blob); L._url = url;
       let img = $('#fv-img', L.dlg);
       if (!img) { img = document.createElement('img'); img.alt = f.name; $('.viewer', L.dlg).prepend(img); }
       img.src = url;
       if (msg) msg.remove();
-    } else if (blob.type === 'application/pdf') {
+    } else if (type === 'application/pdf') {
       renderPdfInto(L, blob);
-    } else {
+    } else if (/^text\/|json/.test(type)) {
       const t = await blob.text();
       if (msg) msg.remove();
       $('#fv-pages', L.dlg).innerHTML = `<pre>${esc(t.slice(0, 300000))}</pre>`;
+    } else if (msg) {
+      msg.textContent = `${fmtBytes(blob.size)} · 이 앱에서는 미리 볼 수 없는 파일이에요. ‘기기에 저장’이나 ‘공유’로 다른 앱에서 열어 주세요.`;
     }
-  }).catch(() => {
+  }).catch((e) => {
     const m = $('#fv-msg', L.dlg);
-    if (m) m.textContent = navigator.onLine ? '파일을 불러오지 못했어요.' : '인터넷에 연결되면 원본을 볼 수 있어요.';
+    if (!m) return;
+    m.textContent = (f.t ? '작은 미리보기만 있어요. ' : '') + fileErrMsg(e);
+    if (e && e.code === 'evicted' && !e.wanted) {
+      $('#fv-act', L.dlg).innerHTML = '<button type="button" class="btn sm pri" id="fv-want">받아오기 요청</button>';
+      $('#fv-want', L.dlg).addEventListener('click', async (ev) => {
+        ev.target.disabled = true;
+        try { await SYNC.requestFile(f.id); m.textContent = '요청했어요. 원본이 있는 기기에서 앱을 인터넷 연결된 상태로 열면 이 기기로 전달돼요.'; ev.target.remove(); }
+        catch (x) { ev.target.disabled = false; toast('요청하지 못했어요. 인터넷 연결을 확인해 주세요.'); }
+      });
+    }
   });
 }
 
@@ -294,9 +315,9 @@ async function renderPdfInto(L, blob) {
 }
 
 // ================= export =================
-async function thumbData(id, max) {
-  const blob = await FILES.get(id);
-  return drawImage(blob, max || 900, 0.82, true);
+async function thumbData(f, max) {
+  try { const blob = await FILES.get(f.id); return await drawImage(blob, max || 900, 0.82, true); }
+  catch (e) { if (f.t) return f.t; throw e; }
 }
 
 async function collectExport(st, onProg) {
@@ -344,7 +365,7 @@ async function exportBlocks(data, photos, onProg) {
       const imgs = (e.files || []).filter((f) => /^image\//.test(f.type));
       if (imgs.length) {
         const srcs = [];
-        for (const f of imgs.slice(0, 6)) { try { srcs.push(await thumbData(f.id, 700)); } catch (err) { /* skip missing */ } }
+        for (const f of imgs.slice(0, 6)) { try { srcs.push(await thumbData(f, 700)); } catch (err) { /* skip missing */ } }
         if (srcs.length) blocks.push(`<div class="pb"><div class="pimgs">${srcs.map((s) => `<img src="${s}" alt="">`).join('')}</div></div>`);
       }
     }
@@ -493,53 +514,6 @@ function openExport(kind, bookId) {
     if (!c || st.busy) return;
     read(); st.range = c.dataset.xr; st.out = null; $('.dlg-b', L.dlg).innerHTML = body();
   });
-}
-
-async function doBackup() {
-  toast('전체 기록을 모으는 중…');
-  await loadMonthsWithProgress(Object.keys(D.index.months || {}));
-  const s = clone(D.settings); delete s.reminders;
-  const data = { app: 'yeokkeum', v: 1, exportedAt: new Date().toISOString(), books: booksArr().map((b) => Object.assign({ id: b.id }, Y.bookDoc(b))), settings: s, entries: Array.from(D.entries.values()).sort(sortEntries).map((e) => Object.assign({ id: e.id }, Y.entryDoc(e))) };
-  await saveFile(`엮음_백업_${Y.today()}.json`, JSON.stringify(data));
-}
-
-const VALID_ID = /^[A-Za-z0-9_\-.~:@+]{1,120}$/;
-async function importData(data, label) {
-  const entries = (data.entries || []).filter((e) => e && typeof e === 'object');
-  const ms = Y.uniq(entries.map((e) => Y.monthOf(Y.normEntry('x', e).date)));
-  await loadMonthsWithProgress(ms);
-  let nb = 0, ne = 0;
-  for (const b of data.books || []) {
-    if (!b || !VALID_ID.test(String(b.id || '')) ) continue;
-    if (label === 'migrate' && D.books.has(b.id)) continue;
-    saveBook(Y.normBook(String(b.id), b)); nb++;
-  }
-  for (const e of entries) {
-    const id = VALID_ID.test(String(e.id || '')) ? String(e.id) : Y.rid('e');
-    saveEntry(Y.normEntry(id, e), { quiet: true }); ne++;
-  }
-  scheduleRender();
-  return { nb, ne };
-}
-
-async function onJsonPicked(file) {
-  let data;
-  try { data = JSON.parse(await file.text()); } catch (e) { toast('백업 파일을 읽지 못했어요'); return; }
-  if (!data || data.app !== 'yeokkeum' || !Array.isArray(data.entries)) { toast('엮음 백업 파일이 아니에요'); return; }
-  const ok = await confirmBox({ title: '백업을 불러올까요?', message: `책 ${(data.books || []).length}권, 기록 ${data.entries.length}개가 들어 있어요. 같은 기록은 백업 내용으로 바뀌고, 나머지 기록은 그대로 남아요.`, ok: '불러오기' });
-  if (!ok) return;
-  const r = await importData(data, 'restore');
-  toast(`책 ${r.nb}권, 기록 ${r.ne}개를 불러왔어요`);
-}
-
-async function migrateLocal() {
-  const loc = LS.get('yk:data');
-  if (!loc || !Array.isArray(loc.entries)) return;
-  const ok = await confirmBox({ title: '계정으로 옮길까요?', message: `이 기기에만 있던 기록 ${loc.entries.length}개를 계정에 저장해요. 옮긴 뒤에는 다른 기기에서도 보여요.`, ok: '옮기기' });
-  if (!ok) return;
-  const r = await importData(loc, 'migrate');
-  LS.del('yk:data');
-  toast(`기록 ${r.ne}개를 계정으로 옮겼어요`);
 }
 
 async function clearExamples() {

@@ -4,12 +4,15 @@
 
 - 주소: https://24nim.github.io/yeokkeum/
 - 휴대폰·태블릿·노트북에서 설치해서 쓰는 웹앱(PWA)이에요.
-- 기록은 주인 구글 계정의 Firebase(무료 요금제, 프로젝트 kimnote-23efc)에 저장되고, Firestore 규칙으로 주인 계정만 읽고 쓸 수 있어요.
+- **원본은 각 기기 안에** 있어요(브라우저의 IndexedDB). 인터넷이 없어도, 로그인하지 않아도 바로 열리고 저장돼요.
+- 주인 구글 계정으로 로그인하면 Firebase(무료 요금제, 프로젝트 kimnote-23efc)가 **기기 사이에 바뀐 내용만 전달**해요. Firestore 규칙으로 주인 계정만 읽고 쓸 수 있어요.
+- 사진·파일은 구글에 600MB까지만 두고, 넘치면 기기 두 대 이상이나 전체 백업에 있는 오래된 것부터 구글에서만 지워요. 그래서 무료 한도를 넘지 않아요.
+- 설정 → 전체 백업은 압축 파일 하나(기록 + 사진 원본 + 앱 없이 열리는 `엮음-보기.html`)를 만들어요.
 - 이 저장소에는 앱 코드만 있고 기록은 없어요.
 
 ## 고치는 방법 (개발용)
 
 - 원본 코드는 `source/src`에 있어요. 루트의 `index.html`, `app.js`, `sw.js`는 빌드 결과물이라 직접 고치지 않아요.
 - 고친 뒤 `sh source/build.sh`를 실행하면 루트에 새 결과물이 만들어지고, 푸시하면 깃허브 페이지에 1~2분 안에 반영돼요.
-- `source/src/logic.js`는 브라우저 없이 `node`로 시험할 수 있어요 (`source/test/learn.test.js` 참고).
-- `source/test/mock-firebase.js`는 Firebase 대신 쓰는 시험용 가짜예요 (Playwright 시험 `flow.py`에서 사용).
+- 구조: `store.js`(기기 안 저장소) · `sync.js`(Firebase 전달) · `files.js`(첨부) · `backup.js` + `zip.js` + `backup-viewer.html`(백업·복원) · `logic.js`(자동 정리·집계, 브라우저 없이 `node`로 시험 가능).
+- 시험: `source/test/sync_test.py`는 가짜 Firebase 서버(`fsserver.py` + `mock-fs.js`)에 여러 기기를 붙여 동기화·오프라인·충돌·사진 전달·정리·옛 버전 이전·백업/복원을 확인해요. `sw_test.py`는 오프라인으로 앱이 열리는지 확인해요.

@@ -34,7 +34,7 @@ async function navStep(dir) {
     const o = olderInfo();
     if (!o.next) { toast('더 이전 기록이 없어요'); return; }
     const cur = secs[i];
-    await ensureMonth(o.next, false);
+    await ensureMonth(o.next);
     render();
     const s2 = $$('[data-sec]', v).map((s) => s.dataset.sec);
     const k = s2.indexOf(cur) - 1;
@@ -55,7 +55,7 @@ function onLogScroll(fromRender) {
   if (cur && cur.dataset.sec !== S.curSec) { S.curSec = cur.dataset.sec; updateCurLabel(); }
   if (!fromRender && v.scrollTop < 140 && !S.olderBusy) {
     const o = olderInfo();
-    if (o.next && !o.loading) { S.olderBusy = true; ensureMonth(o.next, false).finally(() => { S.olderBusy = false; }); }
+    if (o.next && !o.loading) { S.olderBusy = true; ensureMonth(o.next).finally(() => { S.olderBusy = false; }); }
   }
 }
 
@@ -63,7 +63,7 @@ function setTab(tab) {
   if (S.tab === tab && tab === 'shelf' && S.book) { S.book = null; render(); return; }
   S.tab = tab; S.book = null;
   if (tab === 'log') S.scrollToEnd = true;
-  if (tab === 'settings' && CAP.assets && !S.usageAsked) { S.usageAsked = true; CAP.assets.list().then((r) => { S.usage = r && r.usage; scheduleRender(); }).catch(() => {}); }
+  if (tab === 'settings') refreshStoreInfo();
   render();
 }
 
@@ -84,10 +84,10 @@ async function act(a, el) {
     case 'navNext': navStep(1); break;
     case 'goToday': S.composeDate = Y.today(); S.curSec = null; S.scrollToEnd = true; render(); break;
     case 'search': openSearch(); break;
-    case 'syncTap': if (D.failed.size) retryFailed(); else setTab('settings'); break;
+    case 'syncTap': setTab('settings'); if (D.user) SYNC.kick(0); break;
     case 'cmpSend': quickSave(); break;
     case 'cmpAttach': pickFiles('composer'); break;
-    case 'cmpUnfile': { const f = S.pendFiles.find((x) => x.id === id); S.pendFiles = S.pendFiles.filter((x) => x.id !== id); if (f) deleteAsset(f.id); renderComposer(); break; }
+    case 'cmpUnfile': { const f = S.pendFiles.find((x) => x.id === id); S.pendFiles = S.pendFiles.filter((x) => x.id !== id); savePend(); if (f) FILES.remove(f.id); renderComposer(); break; }
     case 'cmpToday': S.composeDate = Y.today(); S.scrollToEnd = true; render(); break;
     case 'cmpForm': {
       const nbs = notebooks().filter((b) => !b.catchAll || Y.allFields(b).length);
@@ -96,7 +96,7 @@ async function act(a, el) {
     }
     case 'tryText': { const t = $('#cmp'); t.value = el.dataset.text; autosize(t); updateSendState(); t.focus(); break; }
     case 'focusCmp': { const t = $('#cmp'); if (t) t.focus(); break; }
-    case 'loadOlder': { const o = olderInfo(); if (o.next) { ensureMonth(o.next, false); scheduleRender(); } break; }
+    case 'loadOlder': { const o = olderInfo(); if (o.next) { ensureMonth(o.next); scheduleRender(); } break; }
     case 'goDay': { S.mode = 'd'; saveUi(); S.curSec = el.dataset.date; render(); scrollToSec(el.dataset.date); break; }
     case 'newPeriod': openEditor(null, { per: el.dataset.per, date: el.dataset.date }); break;
     case 'orgNow': organizeEntry(id); break;
@@ -124,10 +124,13 @@ async function act(a, el) {
     case 'statsRange': S.statsRange = el.dataset.k; saveUi(); render(); break;
     case 'chartDir': S.chartDir = el.dataset.dir === 'in' ? 'in' : 'out'; render(); break;
     case 'clearExamples': clearExamples(); break;
-    case 'migrateLocal': migrateLocal(); break;
     case 'install': promptInstall(); break;
     case 'hideInstall': LS.set('yk:hideInstall', 1); render(); break;
+    case 'signIn': signIn(); break;
     case 'signOut': signOut(); break;
+    case 'hideLogin': hideFor('yk:hideLogin', 7); render(); break;
+    case 'hideBackup': hideFor('yk:hideBackup', 7); render(); break;
+    case 'wipe': wipeDevice(); break;
     case 'loadExamples': loadExamples(); break;
     case 'forget': {
       const L = D.settings.learn || {}; const list = L[el.dataset.b] && L[el.dataset.b][el.dataset.f];
@@ -136,8 +139,8 @@ async function act(a, el) {
     }
     case 'exportPdf': openExport('pdf', ''); break;
     case 'exportCsv': openExport('csv', ''); break;
-    case 'backup': doBackup(); break;
-    case 'restore': { const p = $('#json-pick'); p.value = ''; p.click(); break; }
+    case 'backup': openBackup(); break;
+    case 'restore': pickRestore(); break;
     case 'copyLink': copyText(`${APP_URL}#${el.dataset.h}`); break;
     default: break;
   }
@@ -195,9 +198,7 @@ function onVisible() {
   if (S.todayAtBoot !== t) {
     if (S.composeDate === S.todayAtBoot) S.composeDate = t;
     S.todayAtBoot = t;
-    const m = Y.monthOf(t);
-    const st = D.months.get(m);
-    if (D.mode === 'cloud' && (!st || !st.live)) { if (st && st.unsub) st.unsub(); D.months.delete(m); ensureMonth(m, true); }
+    ensureMonth(Y.monthOf(t));
     scheduleRender();
   }
 }
@@ -237,7 +238,7 @@ function bind() {
   cmp.addEventListener('focus', () => { if (coarse()) document.body.classList.add('typing'); });
   cmp.addEventListener('blur', () => setTimeout(() => document.body.classList.remove('typing'), 120));
   $('#file-pick').addEventListener('change', (ev) => onFilesPicked(ev.target.files));
-  $('#json-pick').addEventListener('change', (ev) => { const f = ev.target.files && ev.target.files[0]; if (f) onJsonPicked(f); });
+  $('#json-pick').addEventListener('change', (ev) => onRestorePicked(ev.target.files));
   window.addEventListener('hashchange', applyHash);
   document.addEventListener('visibilitychange', onVisible);
   let rt = 0;
@@ -257,13 +258,18 @@ function start() {
   }
   const dr = LS.get('yk:draft');
   if (typeof dr === 'string' && dr) { const t = $('#cmp'); t.value = dr; autosize(t); }
+  const pf = LS.get('yk:pendFiles');
+  if (Array.isArray(pf)) S.pendFiles = pf.filter((f) => f && typeof f.id === 'string').map((f) => Y.normEntry('x', { files: [f] }).files[0]).filter(Boolean);
   bind();
   render();
-  bootPlatform().catch((e) => { console.error('[엮음] boot failed', e); if (!D.ready) initLocal('boot-error'); });
+  bootPlatform().catch((e) => {
+    console.error('[엮음] boot failed', e);
+    if (!D.ready) { D.mode = 'memory'; for (const b of Y.defaultBooks()) D.books.set(b.id, b); D.ready = true; render(); }
+  });
 }
 
 // test hook for local checks (harmless in production)
-window.__yk = { S, D, Y, render, quickSave, organizeEntry, openEditor, openExport, makePdf, exportBlocks, collectExport };
+window.__yk = { S, D, Y, DEV, STORE, SYNC, FILES, ZIP, render, quickSave, organizeEntry, openEditor, openExport, makePdf, exportBlocks, collectExport, buildBackup, onRestorePicked, saveEntry, removeEntry, ensureMonth, totalCount, syncState };
 
 start();
 })();
